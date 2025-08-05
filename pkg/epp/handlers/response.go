@@ -42,6 +42,15 @@ func (s *StreamingServer) HandleResponseBody(ctx context.Context, reqCtx *Reques
 		logger.V(logutil.DEFAULT).Error(err, "error marshalling responseBody")
 		return reqCtx, err
 	}
+
+	// Extract worker_instance_id from response body to include in response headers
+	if workerInstanceID, exists := response["worker_instance_id"]; exists {
+		if workerIDStr, ok := workerInstanceID.(string); ok && workerIDStr != "" {
+			reqCtx.WorkerInstanceID = workerIDStr
+			logger.V(logutil.VERBOSE).Info("Extracted worker instance ID from response", "worker_instance_id", workerIDStr)
+		}
+	}
+
 	if response["usage"] != nil {
 		usg := response["usage"].(map[string]any)
 		usage := Usage{
@@ -66,11 +75,36 @@ func (s *StreamingServer) HandleResponseBody(ctx context.Context, reqCtx *Reques
 
 // The function is to handle streaming response if the modelServer is streaming.
 func (s *StreamingServer) HandleResponseBodyModelStreaming(ctx context.Context, reqCtx *RequestContext, responseText string) {
+	logger := log.FromContext(ctx)
+
 	if strings.Contains(responseText, streamingEndMsg) {
 		resp := parseRespForUsage(ctx, responseText)
 		reqCtx.Usage = resp.Usage
 		metrics.RecordInputTokens(reqCtx.Model, reqCtx.ResolvedTargetModel, resp.Usage.PromptTokens)
 		metrics.RecordOutputTokens(reqCtx.Model, reqCtx.ResolvedTargetModel, resp.Usage.CompletionTokens)
+	}
+
+	// Extract worker_instance_id from streaming response text
+	lines := strings.Split(responseText, "\n")
+	for _, line := range lines {
+		if !strings.HasPrefix(line, streamingRespPrefix) {
+			continue
+		}
+		content := strings.TrimPrefix(line, streamingRespPrefix)
+		if content == "[DONE]" {
+			continue
+		}
+
+		var responseData map[string]any
+		if err := json.Unmarshal([]byte(content), &responseData); err == nil {
+			if workerInstanceID, exists := responseData["worker_instance_id"]; exists {
+				if workerIDStr, ok := workerInstanceID.(string); ok && workerIDStr != "" {
+					reqCtx.WorkerInstanceID = workerIDStr
+					logger.V(logutil.VERBOSE).Info("Extracted worker instance ID from streaming response", "worker_instance_id", workerIDStr)
+					break // Found worker_instance_id, no need to continue parsing
+				}
+			}
+		}
 	}
 }
 
@@ -128,6 +162,16 @@ func (s *StreamingServer) generateResponseHeaders(reqCtx *RequestContext) []*con
 				RawValue: []byte("true"),
 			},
 		},
+	}
+
+	// Add worker_instance_id to response headers if available
+	if reqCtx.WorkerInstanceID != "" {
+		headers = append(headers, &configPb.HeaderValueOption{
+			Header: &configPb.HeaderValue{
+				Key:      "x-worker-instance-id",
+				RawValue: []byte(reqCtx.WorkerInstanceID),
+			},
+		})
 	}
 
 	// include all headers

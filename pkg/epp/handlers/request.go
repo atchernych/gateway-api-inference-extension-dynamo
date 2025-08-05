@@ -106,6 +106,7 @@ func (s *StreamingServer) generateHeaders(reqCtx *RequestContext) []*configPb.He
 			},
 		},
 	}
+
 	if reqCtx.RequestSize > 0 {
 		// We need to update the content length header if the body is mutated, see Envoy doc:
 		// https://www.envoyproxy.io/docs/envoy/latest/api-v3/extensions/filters/http/ext_proc/v3/processing_mode.proto
