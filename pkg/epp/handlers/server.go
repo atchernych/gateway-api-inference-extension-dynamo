@@ -17,6 +17,7 @@ limitations under the License.
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -556,8 +557,20 @@ func (s *StreamingServer) fetchWorkerIDFromFrontEnd(ctx context.Context, reqCtx 
 	// Build FrontEnd service URL
 	frontEndURL := fmt.Sprintf("http://%s:%s/worker-assignment", s.frontEndAddress, s.frontEndPort)
 
-	// Create empty request (as specified)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, frontEndURL, nil)
+	// Create request body with nvext annotations
+	requestBody := map[string]interface{}{
+		"nvext": map[string]interface{}{
+			"annotations": []string{"query_instance_id"},
+		},
+	}
+
+	requestJSON, err := json.Marshal(requestBody)
+	if err != nil {
+		logger.V(logutil.DEFAULT).Error(err, "Failed to marshal request body")
+		return fmt.Errorf("failed to marshal request body: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, frontEndURL, bytes.NewBuffer(requestJSON))
 	if err != nil {
 		logger.V(logutil.DEFAULT).Error(err, "Failed to create FrontEnd request")
 		return fmt.Errorf("failed to create FrontEnd request: %w", err)
@@ -567,7 +580,9 @@ func (s *StreamingServer) fetchWorkerIDFromFrontEnd(ctx context.Context, reqCtx 
 	req.Header.Set("Content-Type", "application/json")
 
 	// Make the blocking HTTP request
-	logger.V(logutil.VERBOSE).Info("Making blocking HTTP request to FrontEnd", "url", frontEndURL)
+	logger.V(logutil.VERBOSE).Info("Making blocking HTTP request to FrontEnd",
+		"url", frontEndURL,
+		"body", string(requestJSON))
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
 		logger.V(logutil.DEFAULT).Error(err, "Failed to call FrontEnd service")
