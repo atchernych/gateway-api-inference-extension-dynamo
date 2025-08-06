@@ -116,6 +116,14 @@ func (s *StreamingServer) generateHeaders(reqCtx *RequestContext) []*configPb.He
 			},
 		})
 	}
+
+	// Add host rewrite header
+	headers = append(headers, &configPb.HeaderValueOption{
+		Header: &configPb.HeaderValue{
+			Key:      "host_rewrite_header",
+			RawValue: []byte("x-gateway-destination-endpoint"),
+		},
+	})
 	if reqCtx.RequestSize > 0 {
 		// We need to update the content length header if the body is mutated, see Envoy doc:
 		// https://www.envoyproxy.io/docs/envoy/latest/api-v3/extensions/filters/http/ext_proc/v3/processing_mode.proto
