@@ -555,7 +555,7 @@ func (s *StreamingServer) fetchWorkerIDFromFrontEnd(ctx context.Context, reqCtx 
 	logger := log.FromContext(ctx)
 
 	// Build FrontEnd service URL
-	frontEndURL := fmt.Sprintf("http://%s:%s/worker-assignment", s.frontEndAddress, s.frontEndPort)
+	frontEndURL := fmt.Sprintf("http://localhost:%s/v1/chat/completions", s.frontEndPort)
 
 	// Create request body with nvext annotations
 	requestBody := map[string]interface{}{
