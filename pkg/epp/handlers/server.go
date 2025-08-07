@@ -17,9 +17,12 @@ limitations under the License.
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"net/http"
 	"strings"
 	"time"
 
@@ -50,7 +53,16 @@ func NewStreamingServer(destinationEndpointHintMetadataNamespace, destinationEnd
 		destinationEndpointHintKey:               destinationEndpointHintKey,
 		director:                                 director,
 		datastore:                                datastore,
+		frontEndAddress:                          "localhost", // Default FrontEnd address (same sidecar)
+		frontEndPort:                             "8081",      // Default FrontEnd port
+		httpClient:                               &http.Client{Timeout: 30 * time.Second},
 	}
+}
+
+// SetFrontEndConfig allows configuration of the FrontEnd service endpoint
+func (s *StreamingServer) SetFrontEndConfig(address, port string) {
+	s.frontEndAddress = address
+	s.frontEndPort = port
 }
 
 type Director interface {
@@ -74,6 +86,11 @@ type StreamingServer struct {
 	destinationEndpointHintMetadataNamespace string
 	datastore                                Datastore
 	director                                 Director
+
+	// FrontEnd service configuration for worker ID requests
+	frontEndAddress string
+	frontEndPort    string
+	httpClient      *http.Client
 }
 
 // RequestContext stores context information during the life time of an HTTP request.
@@ -109,6 +126,8 @@ type RequestContext struct {
 	respHeaderResp  *extProcPb.ProcessingResponse
 	respBodyResp    []*extProcPb.ProcessingResponse
 	respTrailerResp *extProcPb.ProcessingResponse
+
+	WorkerInstanceID string // Worker ID from FrontEnd service
 }
 
 type Request struct {
@@ -223,6 +242,12 @@ func (s *StreamingServer) Process(srv extProcPb.ExternalProcessor_ProcessServer)
 				if err != nil {
 					logger.V(logutil.DEFAULT).Error(err, "Error handling request")
 					break
+				}
+
+				// Make blocking HTTP request to FrontEnd service to get worker_instance_id
+				if err = s.fetchWorkerIDFromFrontEnd(ctx, reqCtx); err != nil {
+					logger.V(logutil.DEFAULT).Error(err, "Failed to fetch worker ID from FrontEnd service")
+					// TODO (atchernych) if FrontEnd call fails ?
 				}
 
 				// Populate the ExtProc protocol responses for the request body.
@@ -522,4 +547,77 @@ func buildCommonResponses(bodyBytes []byte, byteLimit int, setEos bool) []*extPr
 	}
 
 	return responses
+}
+
+// fetchWorkerIDFromFrontEnd makes a blocking HTTP request to the FrontEnd service
+// to obtain the worker_instance_id for the current request
+func (s *StreamingServer) fetchWorkerIDFromFrontEnd(ctx context.Context, reqCtx *RequestContext) error {
+	logger := log.FromContext(ctx)
+
+	// Build FrontEnd service URL
+	frontEndURL := fmt.Sprintf("http://localhost:%s/v1/chat/completions", s.frontEndPort)
+
+	// Create request body with nvext annotations
+	requestBody := map[string]interface{}{
+		"nvext": map[string]interface{}{
+			"annotations": []string{"query_instance_id"},
+		},
+	}
+
+	requestJSON, err := json.Marshal(requestBody)
+	if err != nil {
+		logger.V(logutil.DEFAULT).Error(err, "Failed to marshal request body")
+		return fmt.Errorf("failed to marshal request body: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, frontEndURL, bytes.NewBuffer(requestJSON))
+	if err != nil {
+		logger.V(logutil.DEFAULT).Error(err, "Failed to create FrontEnd request")
+		return fmt.Errorf("failed to create FrontEnd request: %w", err)
+	}
+
+	// Set appropriate headers
+	req.Header.Set("Content-Type", "application/json")
+
+	// Make the blocking HTTP request
+	logger.V(logutil.VERBOSE).Info("Making blocking HTTP request to FrontEnd",
+		"url", frontEndURL,
+		"body", string(requestJSON))
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		logger.V(logutil.DEFAULT).Error(err, "Failed to call FrontEnd service")
+		return fmt.Errorf("failed to call FrontEnd service: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		logger.V(logutil.DEFAULT).Error(nil, "FrontEnd service returned non-200 status", "status", resp.StatusCode)
+		return fmt.Errorf("FrontEnd service returned status %d", resp.StatusCode)
+	}
+
+	// Read the response body
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		logger.V(logutil.DEFAULT).Error(err, "Failed to read FrontEnd response body")
+		return fmt.Errorf("failed to read FrontEnd response body: %w", err)
+	}
+
+	// Parse JSON response to extract worker_instance_id
+	var responseData map[string]interface{}
+	if err := json.Unmarshal(body, &responseData); err != nil {
+		logger.V(logutil.DEFAULT).Error(err, "Failed to parse FrontEnd response JSON")
+		return fmt.Errorf("failed to parse FrontEnd response JSON: %w", err)
+	}
+
+	// Extract worker_instance_id from response
+	if workerID, exists := responseData["worker_instance_id"]; exists {
+		if workerIDStr, ok := workerID.(string); ok && workerIDStr != "" {
+			reqCtx.WorkerInstanceID = workerIDStr
+			logger.V(logutil.VERBOSE).Info("Successfully obtained worker ID from FrontEnd", "worker_instance_id", workerIDStr)
+			return nil
+		}
+	}
+
+	logger.V(logutil.DEFAULT).Info("FrontEnd response does not contain valid worker_instance_id", "response_body", string(body))
+	return fmt.Errorf("FrontEnd response does not contain valid worker_instance_id")
 }
