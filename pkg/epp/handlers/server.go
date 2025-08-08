@@ -18,8 +18,13 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"io"
+	"net/http"
 	"time"
+
+	"bytes"
 
 	extProcPb "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	envoyTypePb "github.com/envoyproxy/go-control-plane/envoy/type/v3"
@@ -40,6 +45,11 @@ func NewServer(scheduler Scheduler, destinationEndpointHintMetadataNamespace, de
 		destinationEndpointHintMetadataNamespace: destinationEndpointHintMetadataNamespace,
 		destinationEndpointHintKey:               destinationEndpointHintKey,
 		datastore:                                datastore,
+		frontEndAddress:                          "localhost",
+		frontEndPort:                             "8000",
+		httpClient: &http.Client{
+			Timeout: 10 * time.Second,
+		},
 	}
 }
 
@@ -54,6 +64,11 @@ type Server struct {
 	// back the picked endpoints.
 	destinationEndpointHintMetadataNamespace string
 	datastore                                datastore.Datastore
+
+	// FrontEnd service configuration
+	frontEndAddress string
+	frontEndPort    string
+	httpClient      *http.Client
 }
 
 type Scheduler interface {
@@ -104,7 +119,7 @@ func (s *Server) Process(srv extProcPb.ExternalProcessor_ProcessServer) error {
 		switch v := req.Request.(type) {
 		case *extProcPb.ProcessingRequest_RequestHeaders:
 			reqCtx.RequestReceivedTimestamp = time.Now()
-			resp = HandleRequestHeaders(ctx, reqCtx, req)
+			resp = s.HandleRequestHeaders(ctx, reqCtx, req)
 			loggerVerbose.Info("Request context after HandleRequestHeaders", "context", reqCtx)
 		case *extProcPb.ProcessingRequest_RequestBody:
 			resp, err = s.HandleRequestBody(ctx, reqCtx, req)
@@ -255,3 +270,91 @@ const (
 	BodyResponseResponsesComplete    StreamRequestState = 6
 	TrailerResponseResponsesComplete StreamRequestState = 7
 )
+
+// fetchWorkerIDFromFrontEnd makes a blocking HTTP request to the FrontEnd service
+// to get the worker_instance_id for this request
+func (s *Server) fetchWorkerIDFromFrontEnd(ctx context.Context, reqCtx *RequestContext) error {
+	logger := log.FromContext(ctx)
+	logger.V(logutil.DEFAULT).Info("Starting fetchWorkerIDFromFrontEnd function")
+
+	// Construct FrontEnd URL
+	frontEndURL := fmt.Sprintf("http://%s:%s/v1/chat/completions", s.frontEndAddress, s.frontEndPort)
+	logger.V(logutil.DEFAULT).Info("Constructed FrontEnd URL", "url", frontEndURL)
+
+	// Create request body with nvext annotations
+	requestBody := map[string]interface{}{
+		"nvext": map[string]interface{}{
+			"annotations": []string{"query_instance_id"},
+		},
+	}
+	logger.V(logutil.DEFAULT).Info("Created request body structure", "requestBody", requestBody)
+
+	requestJSON, err := json.Marshal(requestBody)
+	if err != nil {
+		logger.V(logutil.DEFAULT).Error(err, "Failed to marshal request body")
+		return fmt.Errorf("failed to marshal request body: %w", err)
+	}
+	logger.V(logutil.DEFAULT).Info("Successfully marshaled request body to JSON", "json", string(requestJSON))
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, frontEndURL, bytes.NewBuffer(requestJSON))
+	if err != nil {
+		logger.V(logutil.DEFAULT).Error(err, "Failed to create FrontEnd request")
+		return fmt.Errorf("failed to create FrontEnd request: %w", err)
+	}
+	logger.V(logutil.DEFAULT).Info("Successfully created HTTP request object")
+
+	// Set appropriate headers
+	req.Header.Set("Content-Type", "application/json")
+	logger.V(logutil.DEFAULT).Info("Set Content-Type header to application/json")
+
+	// Make the blocking HTTP request to fetch Routing
+	logger.V(logutil.DEFAULT).Info("Making blocking HTTP request to FrontEnd",
+		"url", frontEndURL,
+		"body", string(requestJSON))
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		logger.V(logutil.DEFAULT).Error(err, "Failed to make FrontEnd request")
+		return fmt.Errorf("failed to make FrontEnd request: %w", err)
+	}
+	defer resp.Body.Close()
+	logger.V(logutil.DEFAULT).Info("Successfully received HTTP response from FrontEnd", "statusCode", resp.StatusCode)
+
+	// Read response body
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		logger.V(logutil.DEFAULT).Error(err, "Failed to read FrontEnd response body")
+		return fmt.Errorf("failed to read FrontEnd response body: %w", err)
+	}
+	logger.V(logutil.DEFAULT).Info("Successfully read response body", "bodyLength", len(body), "body", string(body))
+
+	// Parse JSON response
+	var responseData map[string]interface{}
+	if err := json.Unmarshal(body, &responseData); err != nil {
+		logger.V(logutil.DEFAULT).Error(err, "Failed to unmarshal FrontEnd response")
+		return fmt.Errorf("failed to unmarshal FrontEnd response: %w", err)
+	}
+	logger.V(logutil.DEFAULT).Info("Successfully unmarshaled JSON response", "responseData", responseData)
+
+	// Extract worker_instance_id
+	if workerID, exists := responseData["worker_instance_id"]; exists {
+		logger.V(logutil.DEFAULT).Info("Found worker_instance_id key in response", "value", workerID)
+		if workerIDStr, ok := workerID.(string); ok && workerIDStr != "" {
+			reqCtx.WorkerInstanceID = workerIDStr
+			logger.V(logutil.DEFAULT).Info("Extracted worker instance ID from FrontEnd", "worker_instance_id", workerIDStr)
+			logger.V(logutil.DEFAULT).Info("Successfully completed fetchWorkerIDFromFrontEnd function")
+			return nil
+		}
+		logger.V(logutil.DEFAULT).Info("worker_instance_id exists but is not a valid non-empty string", "type", fmt.Sprintf("%T", workerID), "value", workerID)
+	} else {
+		logger.V(logutil.DEFAULT).Info("worker_instance_id key not found in response", "availableKeys", getMapKeys(responseData))
+	}
+
+	logger.V(logutil.DEFAULT).Info("worker_instance_id not found or empty in FrontEnd response")
+	return fmt.Errorf("worker_instance_id not found in FrontEnd response")
+}
+
+// SetFrontEndConfig allows external configuration of the FrontEnd service
+func (s *Server) SetFrontEndConfig(address, port string) {
+	s.frontEndAddress = address
+	s.frontEndPort = port
+}
