@@ -240,6 +240,9 @@ type RequestContext struct {
 	respHeaderResp  *extProcPb.ProcessingResponse
 	respBodyResp    *extProcPb.ProcessingResponse
 	respTrailerResp *extProcPb.ProcessingResponse
+
+	// WorkerInstanceID is the worker chosen by the FrontEnd (Dynamo).
+	WorkerInstanceID string
 }
 
 type StreamRequestState int

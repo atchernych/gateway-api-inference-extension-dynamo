@@ -17,11 +17,13 @@ limitations under the License.
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"math/rand"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -362,6 +364,18 @@ func (s *StreamingServer) HandleRequestBody(
 		return reqCtx, errutil.Error{Code: errutil.Internal, Msg: fmt.Sprintf("error marshaling request body: %v", err)}
 	}
 
+	// ANNA: Ask FrontEnd (sidecar) for worker selection and nvext annotations.
+	if workerID, feErr := s.callFrontEndForWorker(ctx, requestBodyMap); feErr != nil {
+		// Non-fatal: proceed without a worker id if FrontEnd is unavailable.
+		logger.V(logutil.DEFAULT).Error(feErr, "FrontEnd call failed; continuing without worker_instance_id")
+	} else if workerID != "" {
+		reqCtx.WorkerInstanceID = workerID
+		logger.V(logutil.VERBOSE).Info("Extracted worker instance ID from FrontEnd", "worker_instance_id", workerID)
+	}
+	// Temporarily hard-code it for testing. The below works.
+	// reqCtx.WorkerInstanceID = "debug-worker-1"
+	// logger.V(logutil.DEFAULT).Info("HARD CODED worker_instance_id", "worker_instance_id", reqCtx.WorkerInstanceID)
+
 	target, err := s.scheduler.Schedule(ctx, llmReq)
 	if err != nil {
 		return reqCtx, errutil.Error{Code: errutil.InferencePoolResourceExhausted, Msg: fmt.Errorf("failed to find target pod: %w", err).Error()}
@@ -514,6 +528,15 @@ func (s *StreamingServer) populateRequestHeaderResponse(reqCtx *RequestContext, 
 			},
 		})
 	}
+	// ANNA: Inject worker id so the gateway can route to the chosen worker. ---
+	if reqCtx.WorkerInstanceID != "" {
+		headers = append(headers, &configPb.HeaderValueOption{
+			Header: &configPb.HeaderValue{
+				Key:      "x-gateway-worker-id",
+				RawValue: []byte(reqCtx.WorkerInstanceID),
+			},
+		})
+	}
 
 	targetEndpointValue := &structpb.Struct{
 		Fields: map[string]*structpb.Value{
@@ -551,6 +574,101 @@ func (s *StreamingServer) populateRequestHeaderResponse(reqCtx *RequestContext, 
 		},
 		DynamicMetadata: dynamicMetadata,
 	}
+}
+
+// ANNA: Blocking call to FrontEnd sidecar to obtain worker_instance_id
+func (s *StreamingServer) callFrontEndForWorker(ctx context.Context, originalBody map[string]interface{}) (string, error) {
+	logger := log.FromContext(ctx)
+	startTime := time.Now()
+	logger.V(logutil.DEFAULT).Info("FrontEnd call started", "start_time", startTime)
+
+	feURL := "http://127.0.0.1:8000/v1/chat/completions"
+
+	// Shallow copy original body and add the nvext annotations.
+	bodyPrepStart := time.Now()
+	feBody := make(map[string]interface{}, len(originalBody)+1)
+	for k, v := range originalBody {
+		feBody[k] = v
+	}
+	nvext, _ := feBody["nvext"].(map[string]interface{})
+	if nvext == nil {
+		nvext = map[string]interface{}{}
+	}
+	nvext["annotations"] = []string{"query_instance_id"}
+	feBody["nvext"] = nvext
+	logger.V(logutil.DEFAULT).Info("FrontEnd body prepared", "elapsed_ms", time.Since(bodyPrepStart).Milliseconds())
+	logger.V(logutil.DEFAULT).Info("FrontEnd request body", "body", feBody)
+
+	marshalStart := time.Now()
+	payload, err := json.Marshal(feBody)
+	if err != nil {
+		logger.V(logutil.DEFAULT).Error(err, "FrontEnd marshal failed", "total_elapsed_ms", time.Since(startTime).Milliseconds())
+		return "", fmt.Errorf("marshal FrontEnd body: %w", err)
+	}
+	logger.V(logutil.DEFAULT).Info("FrontEnd payload marshaled", "elapsed_ms", time.Since(marshalStart).Milliseconds(), "payload_size", len(payload))
+
+	reqBuildStart := time.Now()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, feURL, bytes.NewReader(payload))
+	if err != nil {
+		logger.V(logutil.DEFAULT).Error(err, "FrontEnd request build failed", "total_elapsed_ms", time.Since(startTime).Milliseconds())
+		return "", fmt.Errorf("build FrontEnd request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	logger.V(logutil.DEFAULT).Info("FrontEnd request built", "elapsed_ms", time.Since(reqBuildStart).Milliseconds(), "url", feURL)
+
+	clientCreateStart := time.Now()
+	client := &http.Client{Timeout: 3 * time.Second}
+	logger.V(logutil.DEFAULT).Info("FrontEnd client created", "elapsed_ms", time.Since(clientCreateStart).Milliseconds(), "timeout_seconds", 3)
+
+	httpCallStart := time.Now()
+	logger.V(logutil.DEFAULT).Info("FrontEnd HTTP call starting", "call_start_time", httpCallStart)
+	resp, err := client.Do(req)
+	httpCallDuration := time.Since(httpCallStart)
+	if err != nil {
+		logger.V(logutil.DEFAULT).Error(err, "FrontEnd POST failed", "http_call_duration_ms", httpCallDuration.Milliseconds(), "total_elapsed_ms", time.Since(startTime).Milliseconds())
+		return "", fmt.Errorf("FrontEnd POST failed: %w", err)
+	}
+	logger.V(logutil.DEFAULT).Info("FrontEnd HTTP call completed", "http_call_duration_ms", httpCallDuration.Milliseconds(), "status_code", resp.StatusCode)
+
+	defer resp.Body.Close()
+	bodyReadStart := time.Now()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		logger.V(logutil.DEFAULT).Error(err, "FrontEnd response read failed", "body_read_duration_ms", time.Since(bodyReadStart).Milliseconds(), "total_elapsed_ms", time.Since(startTime).Milliseconds())
+		return "", fmt.Errorf("read FrontEnd response: %w", err)
+	}
+	logger.V(logutil.DEFAULT).Info("FrontEnd response body read", "body_read_duration_ms", time.Since(bodyReadStart).Milliseconds(), "response_size", len(body))
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		logger.V(logutil.DEFAULT).Error(nil, "FrontEnd non-2xx response", "status_code", resp.StatusCode, "response_body", string(body), "total_elapsed_ms", time.Since(startTime).Milliseconds())
+		return "", fmt.Errorf("FrontEnd non-2xx: %d body=%s", resp.StatusCode, string(body))
+	}
+
+	unmarshalStart := time.Now()
+	var responseData map[string]interface{}
+	if err := json.Unmarshal(body, &responseData); err != nil {
+		logger.V(logutil.DEFAULT).Error(err, "FrontEnd response unmarshal failed", "unmarshal_duration_ms", time.Since(unmarshalStart).Milliseconds(), "total_elapsed_ms", time.Since(startTime).Milliseconds())
+		return "", fmt.Errorf("unmarshal FrontEnd response JSON: %w", err)
+	}
+	logger.V(logutil.DEFAULT).Info("FrontEnd response unmarshaled", "unmarshal_duration_ms", time.Since(unmarshalStart).Milliseconds())
+
+	parseStart := time.Now()
+	// Prefer annotated shape: { "annotations": { "worker_instance_id": "..." } }
+	if ann, ok := responseData["annotations"].(map[string]interface{}); ok {
+		if wid, ok := ann["worker_instance_id"].(string); ok && wid != "" {
+			logger.V(logutil.DEFAULT).Info("FrontEnd worker_instance_id found in annotations", "worker_instance_id", wid, "parse_duration_ms", time.Since(parseStart).Milliseconds(), "total_elapsed_ms", time.Since(startTime).Milliseconds())
+			return wid, nil
+		}
+	}
+
+	// Fallback: { "worker_instance_id": "..." }
+	if wid, ok := responseData["worker_instance_id"].(string); ok && wid != "" {
+		logger.V(logutil.DEFAULT).Info("FrontEnd worker_instance_id found in root", "worker_instance_id", wid, "parse_duration_ms", time.Since(parseStart).Milliseconds(), "total_elapsed_ms", time.Since(startTime).Milliseconds())
+		return wid, nil
+	}
+
+	logger.V(logutil.DEFAULT).Error(nil, "FrontEnd worker_instance_id not found", "response_data", responseData, "parse_duration_ms", time.Since(parseStart).Milliseconds(), "total_elapsed_ms", time.Since(startTime).Milliseconds())
+	return "", fmt.Errorf("worker_instance_id not found")
 }
 
 func RandomWeightedDraw(logger logr.Logger, model *v1alpha2.InferenceModel, seed int64) string {
