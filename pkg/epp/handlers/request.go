@@ -133,10 +133,6 @@ func (s *Server) HandleRequestBody(
 			},
 		},
 	}
-	// Print headers for debugging
-	for _, header := range headers {
-		logger.V(logutil.DEBUG).Info("Request body header", "key", header.Header.Key, "value", header.Header.RawValue)
-	}
 
 	targetEndpointValue := &structpb.Struct{
 		Fields: map[string]*structpb.Value{
@@ -184,14 +180,42 @@ func (s *Server) HandleRequestBody(
 	return resp, nil
 }
 
-func HandleRequestHeaders(
+func (s *Server) HandleRequestHeaders(
 	ctx context.Context,
 	reqCtx *RequestContext,
 	req *extProcPb.ProcessingRequest,
 ) *extProcPb.ProcessingResponse {
+	logger := log.FromContext(ctx)
 	r := req.Request
 	h := r.(*extProcPb.ProcessingRequest_RequestHeaders)
-	log.FromContext(ctx).V(logutil.VERBOSE).Info("Handling request headers", "headers", h)
+	logger.V(logutil.VERBOSE).Info("Handling request headers", "headers", h)
+
+	// Call FrontEnd service to get worker instance ID
+	if err := s.fetchWorkerIDFromFrontEnd(ctx, reqCtx); err != nil {
+		logger.V(logutil.DEFAULT).Error(err, "Failed to fetch worker ID from FrontEnd service")
+		// Continue processing even if FrontEnd call fails
+	}
+
+	// Create headers array starting with worker ID if available
+	var headers []*configPb.HeaderValueOption
+
+	// Add worker ID header if obtained from FrontEnd service
+	if reqCtx.WorkerInstanceID != "" {
+		headers = append(headers, &configPb.HeaderValueOption{
+			Header: &configPb.HeaderValue{
+				Key:      "x-gateway-worker-id",
+				RawValue: []byte(reqCtx.WorkerInstanceID),
+			},
+			AppendAction: configPb.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+		})
+		headers = append(headers, &configPb.HeaderValueOption{
+			Header: &configPb.HeaderValue{
+				Key:      "host_rewrite_header",
+				RawValue: []byte("x-gateway-destination-endpoint"),
+			},
+			AppendAction: configPb.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+		})
+	}
 
 	resp := &extProcPb.ProcessingResponse{
 		Response: &extProcPb.ProcessingResponse_RequestHeaders{
@@ -201,6 +225,9 @@ func HandleRequestHeaders(
 					// based on the new "target-pod" header.
 					// See https://www.envoyproxy.io/docs/envoy/latest/api-v3/service/ext_proc/v3/external_processor.proto#service-ext-proc-v3-commonresponse.
 					ClearRouteCache: true,
+					HeaderMutation: &extProcPb.HeaderMutation{
+						SetHeaders: headers,
+					},
 				},
 			},
 		},
