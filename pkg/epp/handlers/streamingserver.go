@@ -532,7 +532,7 @@ func (s *StreamingServer) populateRequestHeaderResponse(reqCtx *RequestContext, 
 	if reqCtx.WorkerInstanceID != "" {
 		headers = append(headers, &configPb.HeaderValueOption{
 			Header: &configPb.HeaderValue{
-				Key:      "x-gateway-worker-id",
+				Key:      "x-worker-instance-id",
 				RawValue: []byte(reqCtx.WorkerInstanceID),
 			},
 		})
@@ -653,7 +653,21 @@ func (s *StreamingServer) callFrontEndForWorker(ctx context.Context, originalBod
 	logger.V(logutil.DEFAULT).Info("FrontEnd response unmarshaled", "unmarshal_duration_ms", time.Since(unmarshalStart).Milliseconds())
 
 	parseStart := time.Now()
-	// Prefer annotated shape: { "annotations": { "worker_instance_id": "..." } }
+	// Check header first: x-worker-instance-id
+	hdrCheckStart := time.Now()
+	widHdr := resp.Header.Get("x-worker-instance-id")
+	logger.V(logutil.DEFAULT).Info("FrontEnd header lookup for x-worker-instance-id", "present", widHdr != "")
+	if widHdr != "" {
+		logger.V(logutil.DEFAULT).Info(
+			"FrontEnd worker_instance_id found in header",
+			"worker_instance_id", widHdr,
+			"header_parse_duration_ms", time.Since(hdrCheckStart).Milliseconds(),
+			"total_elapsed_ms", time.Since(startTime).Milliseconds(),
+		)
+		return widHdr, nil
+	}
+
+	// Check annotated: { "annotations": { "worker_instance_id": "..." } }
 	if ann, ok := responseData["annotations"].(map[string]interface{}); ok {
 		if wid, ok := ann["worker_instance_id"].(string); ok && wid != "" {
 			logger.V(logutil.DEFAULT).Info("FrontEnd worker_instance_id found in annotations", "worker_instance_id", wid, "parse_duration_ms", time.Since(parseStart).Milliseconds(), "total_elapsed_ms", time.Since(startTime).Milliseconds())
