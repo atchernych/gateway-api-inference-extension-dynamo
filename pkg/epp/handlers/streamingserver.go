@@ -590,12 +590,47 @@ func (s *StreamingServer) callFrontEndForWorker(ctx context.Context, originalBod
 	for k, v := range originalBody {
 		feBody[k] = v
 	}
+	// Always enable streaming unless already specified
+	if _, ok := feBody["stream"]; !ok {
+		feBody["stream"] = true
+	}
 	nvext, _ := feBody["nvext"].(map[string]interface{})
 	if nvext == nil {
 		nvext = map[string]interface{}{}
 	}
-	nvext["annotations"] = []string{"query_instance_id"}
+
+	var anns []string
+
+	switch v := nvext["annotations"].(type) {
+	case []string:
+		anns = append(anns, v...)
+	case []interface{}:
+		for _, x := range v {
+			if s, ok := x.(string); ok {
+				anns = append(anns, s)
+			}
+		}
+	case nil:
+		// no annotations
+	default:
+		// ignore unexpected type
+	}
+
+	need_query_instance_id := "query_instance_id"
+	found := false
+	for _, a := range anns {
+		if a == need_query_instance_id {
+			found = true
+			break
+		}
+	}
+	if !found {
+		anns = append(anns, need_query_instance_id)
+	}
+
+	nvext["annotations"] = anns
 	feBody["nvext"] = nvext
+
 	logger.V(logutil.DEFAULT).Info("FrontEnd body prepared", "elapsed_ms", time.Since(bodyPrepStart).Milliseconds())
 	logger.V(logutil.DEFAULT).Info("FrontEnd request body", "body", feBody)
 
@@ -614,6 +649,7 @@ func (s *StreamingServer) callFrontEndForWorker(ctx context.Context, originalBod
 		return "", fmt.Errorf("build FrontEnd request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
 	logger.V(logutil.DEFAULT).Info("FrontEnd request built", "elapsed_ms", time.Since(reqBuildStart).Milliseconds(), "url", feURL)
 
 	clientCreateStart := time.Now()
