@@ -17,6 +17,7 @@ limitations under the License.
 package handlers
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -606,8 +607,8 @@ func (s *StreamingServer) callFrontEndForWorker(ctx context.Context, originalBod
 		anns = append(anns, v...)
 	case []interface{}:
 		for _, x := range v {
-			if s, ok := x.(string); ok {
-				anns = append(anns, s)
+			if response_str, ok := x.(string); ok {
+				anns = append(anns, response_str)
 			}
 		}
 	case nil:
@@ -643,6 +644,8 @@ func (s *StreamingServer) callFrontEndForWorker(ctx context.Context, originalBod
 	logger.V(logutil.DEFAULT).Info("FrontEnd payload marshaled", "elapsed_ms", time.Since(marshalStart).Milliseconds(), "payload_size", len(payload))
 
 	reqBuildStart := time.Now()
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, feURL, bytes.NewReader(payload))
 	if err != nil {
 		logger.V(logutil.DEFAULT).Error(err, "FrontEnd request build failed", "total_elapsed_ms", time.Since(startTime).Milliseconds())
@@ -653,7 +656,7 @@ func (s *StreamingServer) callFrontEndForWorker(ctx context.Context, originalBod
 	logger.V(logutil.DEFAULT).Info("FrontEnd request built", "elapsed_ms", time.Since(reqBuildStart).Milliseconds(), "url", feURL)
 
 	clientCreateStart := time.Now()
-	client := &http.Client{Timeout: 3 * time.Second}
+	client := &http.Client{Timeout: 0}
 	logger.V(logutil.DEFAULT).Info("FrontEnd client created", "elapsed_ms", time.Since(clientCreateStart).Milliseconds(), "timeout_seconds", 3)
 
 	httpCallStart := time.Now()
@@ -667,57 +670,80 @@ func (s *StreamingServer) callFrontEndForWorker(ctx context.Context, originalBod
 	logger.V(logutil.DEFAULT).Info("FrontEnd HTTP call completed", "http_call_duration_ms", httpCallDuration.Milliseconds(), "status_code", resp.StatusCode)
 
 	defer resp.Body.Close()
-	bodyReadStart := time.Now()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		logger.V(logutil.DEFAULT).Error(err, "FrontEnd response read failed", "body_read_duration_ms", time.Since(bodyReadStart).Milliseconds(), "total_elapsed_ms", time.Since(startTime).Milliseconds())
-		return "", fmt.Errorf("read FrontEnd response: %w", err)
-	}
-	logger.V(logutil.DEFAULT).Info("FrontEnd response body read", "body_read_duration_ms", time.Since(bodyReadStart).Milliseconds(), "response_size", len(body))
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		logger.V(logutil.DEFAULT).Error(nil, "FrontEnd non-2xx response", "status_code", resp.StatusCode, "response_body", string(body), "total_elapsed_ms", time.Since(startTime).Milliseconds())
-		return "", fmt.Errorf("FrontEnd non-2xx: %d body=%s", resp.StatusCode, string(body))
-	}
-
-	unmarshalStart := time.Now()
-	var responseData map[string]interface{}
-	if err := json.Unmarshal(body, &responseData); err != nil {
-		logger.V(logutil.DEFAULT).Error(err, "FrontEnd response unmarshal failed", "unmarshal_duration_ms", time.Since(unmarshalStart).Milliseconds(), "total_elapsed_ms", time.Since(startTime).Milliseconds())
-		return "", fmt.Errorf("unmarshal FrontEnd response JSON: %w", err)
-	}
-	logger.V(logutil.DEFAULT).Info("FrontEnd response unmarshaled", "unmarshal_duration_ms", time.Since(unmarshalStart).Milliseconds())
-
-	parseStart := time.Now()
-	// Check header first: x-worker-instance-id
-	hdrCheckStart := time.Now()
-	widHdr := resp.Header.Get("x-worker-instance-id")
-	logger.V(logutil.DEFAULT).Info("FrontEnd header lookup for x-worker-instance-id", "present", widHdr != "")
-	if widHdr != "" {
-		logger.V(logutil.DEFAULT).Info(
-			"FrontEnd worker_instance_id found in header",
-			"worker_instance_id", widHdr,
-			"header_parse_duration_ms", time.Since(hdrCheckStart).Milliseconds(),
+		errBody, _ := io.ReadAll(resp.Body)
+		logger.V(logutil.DEFAULT).Error(nil, "FrontEnd non-2xx response",
+			"status_code", resp.StatusCode,
+			"response_body", string(errBody),
 			"total_elapsed_ms", time.Since(startTime).Milliseconds(),
 		)
-		return widHdr, nil
+		return "", fmt.Errorf("FrontEnd error: %d body=%s", resp.StatusCode, string(errBody))
 	}
 
-	// Check annotated: { "annotations": { "worker_instance_id": "..." } }
-	if ann, ok := responseData["annotations"].(map[string]interface{}); ok {
-		if wid, ok := ann["worker_instance_id"].(string); ok && wid != "" {
-			logger.V(logutil.DEFAULT).Info("FrontEnd worker_instance_id found in annotations", "worker_instance_id", wid, "parse_duration_ms", time.Since(parseStart).Milliseconds(), "total_elapsed_ms", time.Since(startTime).Milliseconds())
-			return wid, nil
+	ct := strings.ToLower(resp.Header.Get("Content-Type"))
+	if strings.Contains(ct, "text/event-stream") {
+		logger.V(logutil.DEFAULT).Info("FrontEnd response is SSE; parsing stream")
+		reader := bufio.NewReader(resp.Body)
+		var (
+			line string
+			err  error
+		)
+
+		for {
+			line, err = reader.ReadString('\n')
+			if err != nil {
+				if err == io.EOF {
+					break
+				}
+				logger.V(logutil.DEFAULT).Error(err, "SSE read error")
+				return "", fmt.Errorf("sse read error: %w", err)
+			}
+
+			line = strings.TrimRight(line, "\r\n")
+			if line == "" {
+				// blank line separates events (continue)
+				continue
+			}
+
+			if strings.HasPrefix(line, "data: ") {
+				payload := strings.TrimPrefix(line, "data: ")
+				if payload == "[DONE]" {
+					logger.V(logutil.DEFAULT).Info("SSE stream DONE before worker id")
+					break
+				}
+
+				// Try to parse JSON data line
+				var msg map[string]interface{}
+				if err := json.Unmarshal([]byte(payload), &msg); err != nil {
+					logger.V(logutil.DEFAULT).Info("SSE data not JSON; skipping", "line", payload)
+					continue
+				}
+
+				// check the body first
+				if wid, ok := msg["worker_instance_id"].(string); ok && wid != "" {
+					logger.V(logutil.DEFAULT).Info("worker_instance_id found in SSE payload root", "worker_instance_id", wid)
+					return wid, nil
+				}
+
+				// check annotations if not in the body
+				if ann, ok := msg["annotations"].(map[string]interface{}); ok {
+					if wid, ok := ann["worker_instance_id"].(string); ok && wid != "" {
+						logger.V(logutil.DEFAULT).Info("worker_instance_id found in SSE annotations", "worker_instance_id", wid)
+						return wid, nil
+					}
+				}
+
+			}
 		}
+
+		// If we got here, SSE didn’t carry the id
+		return "", fmt.Errorf("worker_instance_id not found in SSE stream")
 	}
 
-	// Fallback: { "worker_instance_id": "..." }
-	if wid, ok := responseData["worker_instance_id"].(string); ok && wid != "" {
-		logger.V(logutil.DEFAULT).Info("FrontEnd worker_instance_id found in root", "worker_instance_id", wid, "parse_duration_ms", time.Since(parseStart).Milliseconds(), "total_elapsed_ms", time.Since(startTime).Milliseconds())
-		return wid, nil
-	}
+	logger.V(logutil.DEFAULT).Error(nil, "FrontEnd worker_instance_id not found",
+		"processing_time_ms", time.Since(startTime).Milliseconds())
 
-	logger.V(logutil.DEFAULT).Error(nil, "FrontEnd worker_instance_id not found", "response_data", responseData, "parse_duration_ms", time.Since(parseStart).Milliseconds(), "total_elapsed_ms", time.Since(startTime).Milliseconds())
 	return "", fmt.Errorf("worker_instance_id not found")
 }
 
