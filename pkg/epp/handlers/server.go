@@ -241,7 +241,7 @@ type RequestContext struct {
 	respBodyResp    *extProcPb.ProcessingResponse
 	respTrailerResp *extProcPb.ProcessingResponse
 
-	// WorkerInstanceID is the worker chosen by the FrontEnd (Dynamo).
+	// WorkerInstanceID is the worker chosen by the Dynamo FrontEnd/router.
 	WorkerInstanceID string
 }
 

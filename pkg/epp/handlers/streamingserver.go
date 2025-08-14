@@ -365,10 +365,10 @@ func (s *StreamingServer) HandleRequestBody(
 		return reqCtx, errutil.Error{Code: errutil.Internal, Msg: fmt.Sprintf("error marshaling request body: %v", err)}
 	}
 
-	// Ask FrontEnd (sidecar) for worker selection and nvext annotations.
+	// Ask the Dynamo FrontEnd for worker selection.
 	if workerID, feErr := s.callFrontEndForWorker(ctx, requestBodyMap); feErr != nil {
-		// Proceed without a worker id if FrontEnd is unavailable.
-		logger.V(logutil.DEFAULT).Error(feErr, "FrontEnd call failed; continuing without worker_instance_id")
+		// Proceed without a worker_instance_id if FrontEnd is unavailable.
+		logger.V(logutil.DEFAULT).Error(feErr, "FrontEnd call failed. Continuing without worker_instance_id")
 	} else if workerID != "" {
 		reqCtx.WorkerInstanceID = workerID
 		logger.V(logutil.VERBOSE).Info("Extracted worker instance ID from FrontEnd", "worker_instance_id", workerID)
@@ -526,7 +526,8 @@ func (s *StreamingServer) populateRequestHeaderResponse(reqCtx *RequestContext, 
 			},
 		})
 	}
-	// ANNA: Inject worker id so the gateway can route to the chosen worker. ---
+	// Inject worker_instance_id reported by Dynamo router so the gateway can route to the chosen worker.
+	logger := log.Log.WithName("handlers").WithName("populateRequestHeaderResponse")
 	if reqCtx.WorkerInstanceID != "" {
 		headers = append(headers, &configPb.HeaderValueOption{
 			Header: &configPb.HeaderValue{
@@ -534,6 +535,14 @@ func (s *StreamingServer) populateRequestHeaderResponse(reqCtx *RequestContext, 
 				RawValue: []byte(reqCtx.WorkerInstanceID),
 			},
 		})
+		logger.V(logutil.VERBOSE).Info(
+			"Injected x-worker-instance-id header",
+			"worker_instance_id", reqCtx.WorkerInstanceID,
+		)
+	} else {
+		logger.V(logutil.VERBOSE).Info(
+			"Did not inject x-worker-instance-id header (empty worker id)",
+		)
 	}
 
 	targetEndpointValue := &structpb.Struct{
@@ -574,20 +583,16 @@ func (s *StreamingServer) populateRequestHeaderResponse(reqCtx *RequestContext, 
 	}
 }
 
-// Blocking call to FrontEnd sidecar to obtain worker_instance_id
+// Blocking call to the FrontEnd to obtain the Dynamo worker_instance_id for routing.
 func (s *StreamingServer) callFrontEndForWorker(ctx context.Context, originalBody map[string]interface{}) (string, error) {
 	logger := log.FromContext(ctx)
-	startTime := time.Now()
-	logger.V(logutil.DEFAULT).Info("FrontEnd call started", "start_time", startTime)
-
 	feURL := "http://127.0.0.1:8000/v1/chat/completions"
 
-	bodyPrepStart := time.Now()
 	feBody := make(map[string]interface{}, len(originalBody)+1)
 	for k, v := range originalBody {
 		feBody[k] = v
 	}
-	// Make sure we send the streaming request.
+	// Make sure we send the streaming type request.
 	if _, ok := feBody["stream"]; !ok {
 		feBody["stream"] = true
 	}
@@ -619,68 +624,52 @@ func (s *StreamingServer) callFrontEndForWorker(ctx context.Context, originalBod
 	}
 	nvext["annotations"] = anns
 	feBody["nvext"] = nvext
-	logger.V(logutil.DEFAULT).Info("FrontEnd body prepared", "elapsed_ms", time.Since(bodyPrepStart).Milliseconds())
-	logger.V(logutil.DEFAULT).Info("FrontEnd request body", "body", feBody)
 
-	marshalStart := time.Now()
 	payload, err := json.Marshal(feBody)
 	if err != nil {
-		logger.V(logutil.DEFAULT).Error(err, "FrontEnd marshal failed", "total_elapsed_ms", time.Since(startTime).Milliseconds())
+		logger.V(logutil.DEFAULT).Error(err, "Dynamo FrontEnd marshal failed")
 		return "", fmt.Errorf("marshal FrontEnd body: %w", err)
 	}
-	logger.V(logutil.DEFAULT).Info("FrontEnd payload marshaled", "elapsed_ms", time.Since(marshalStart).Milliseconds(), "payload_size", len(payload))
 
-	reqBuildStart := time.Now()
 	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, feURL, bytes.NewReader(payload))
 	if err != nil {
-		logger.V(logutil.DEFAULT).Error(err, "FrontEnd request build failed", "total_elapsed_ms", time.Since(startTime).Milliseconds())
+		logger.V(logutil.DEFAULT).Error(err, " Dynamo FrontEnd request build failed")
 		return "", fmt.Errorf("build FrontEnd request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
-	logger.V(logutil.DEFAULT).Info("FrontEnd request built", "elapsed_ms", time.Since(reqBuildStart).Milliseconds(), "url", feURL)
 
-	clientCreateStart := time.Now()
 	client := &http.Client{Timeout: 0}
-	logger.V(logutil.DEFAULT).Info("FrontEnd client created", "elapsed_ms", time.Since(clientCreateStart).Milliseconds(), "timeout_seconds", 0)
 
-	httpCallStart := time.Now()
-	logger.V(logutil.DEFAULT).Info("FrontEnd HTTP call starting", "call_start_time", httpCallStart)
 	resp, err := client.Do(req)
-	httpCallDuration := time.Since(httpCallStart)
 	if err != nil {
-		logger.V(logutil.DEFAULT).Error(err, "FrontEnd POST failed", "http_call_duration_ms", httpCallDuration.Milliseconds(), "total_elapsed_ms", time.Since(startTime).Milliseconds())
+		logger.V(logutil.DEFAULT).Error(err, " Dynamo FrontEnd POST failed")
 		return "", fmt.Errorf("FrontEnd POST failed: %w", err)
 	}
 	defer resp.Body.Close()
-	logger.V(logutil.DEFAULT).Info("FrontEnd HTTP call completed", "http_call_duration_ms", httpCallDuration.Milliseconds(), "status_code", resp.StatusCode)
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		errBody, _ := io.ReadAll(resp.Body)
-		logger.V(logutil.DEFAULT).Error(nil, "FrontEnd non-2xx response",
+		logger.V(logutil.DEFAULT).Error(nil, "Dynamo FrontEnd non-2xx response",
 			"status_code", resp.StatusCode,
 			"response_body", string(errBody),
-			"total_elapsed_ms", time.Since(startTime).Milliseconds(),
 		)
-		return "", fmt.Errorf("FrontEnd error: %d body=%s", resp.StatusCode, string(errBody))
+		return "", fmt.Errorf("Dynamo FrontEnd error: %d body=%s", resp.StatusCode, string(errBody))
 	}
 
 	ct := strings.ToLower(resp.Header.Get("Content-Type"))
 	if !strings.Contains(ct, "text/event-stream") {
-		logger.V(logutil.DEFAULT).Error(nil, "Unexpected non-SSE response",
-			"content_type", resp.Header.Get("Content-Type"),
-			"processing_time_ms", time.Since(startTime).Milliseconds())
+		logger.V(logutil.DEFAULT).Error(nil, "Unexpected non-SSE response")
 		return "", fmt.Errorf("unexpected non-SSE response (Content-Type=%q)", resp.Header.Get("Content-Type"))
 	}
 
-	logger.V(logutil.DEFAULT).Info("FrontEnd response is SSE; parsing stream")
-	// We expect the information in the following format below.
+	// We expect the information in the following format:
 	// event: worker_instance_id
 	// : "8303679623149182543"
-
+	//
 	// data: [DONE]
 	reader := bufio.NewReader(resp.Body)
 
@@ -691,7 +680,6 @@ func (s *StreamingServer) callFrontEndForWorker(ctx context.Context, originalBod
 	)
 
 	flushEvent := func() (string, bool, error) {
-		// Try data first
 		data := strings.TrimSpace(dataBuf.String())
 		comment := strings.TrimSpace(commentBuf.String())
 		dataBuf.Reset()
@@ -699,14 +687,13 @@ func (s *StreamingServer) callFrontEndForWorker(ctx context.Context, originalBod
 
 		// Handle [DONE]
 		if data == "[DONE]" || comment == "[DONE]" {
-			logger.V(logutil.DEFAULT).Info("SSE stream DONE",
-				"processing_time_ms", time.Since(startTime).Milliseconds())
+			logger.V(logutil.DEFAULT).Info("SSE stream DONE")
 			return "", true, nil
 		}
 
 		// If this is the special event carrying the id by name, prefer its payload
 		if eventName == "worker_instance_id" {
-			// The FE example puts the id on a comment line, quoted:  : "8303..."
+			// The Dynamo FrontEnd puts the id on a comment line, quoted:  : "8303..."
 			candidate := data
 			if candidate == "" {
 				candidate = comment
@@ -715,17 +702,15 @@ func (s *StreamingServer) callFrontEndForWorker(ctx context.Context, originalBod
 				// Try JSON string first (e.g. "8303679...")
 				var s string
 				if json.Unmarshal([]byte(candidate), &s) == nil && s != "" {
-					logger.V(logutil.DEFAULT).Info("worker_instance_id extracted from named event",
-						"worker_instance_id", s,
-						"processing_time_ms", time.Since(startTime).Milliseconds())
+					logger.V(logutil.VERBOSE).Info("Dynamo worker_instance_id extracted from named event",
+						"worker_instance_id", s)
 					return s, false, nil
 				}
 				// Fallback: raw strip quotes
 				clean := strings.Trim(candidate, "\"")
 				if clean != "" && clean != "[DONE]" {
-					logger.V(logutil.DEFAULT).Info("worker_instance_id extracted (raw) from named event",
-						"worker_instance_id", clean,
-						"processing_time_ms", time.Since(startTime).Milliseconds())
+					logger.V(logutil.DEFAULT).Info("Dynamo worker_instance_id extracted (raw) from named event",
+						"worker_instance_id", clean)
 					return clean, false, nil
 				}
 			}
@@ -737,17 +722,15 @@ func (s *StreamingServer) callFrontEndForWorker(ctx context.Context, originalBod
 			if json.Unmarshal([]byte(data), &msg) == nil {
 				// top-level
 				if wid, ok := msg["worker_instance_id"].(string); ok && wid != "" {
-					logger.V(logutil.DEFAULT).Info("worker_instance_id found in SSE payload root",
-						"worker_instance_id", wid,
-						"processing_time_ms", time.Since(startTime).Milliseconds())
+					logger.V(logutil.DEFAULT).Info("Dynamo worker_instance_id found in SSE payload root",
+						"worker_instance_id", wid)
 					return wid, false, nil
 				}
 				// annotations map
 				if ann, ok := msg["annotations"].(map[string]interface{}); ok {
 					if wid, ok := ann["worker_instance_id"].(string); ok && wid != "" {
-						logger.V(logutil.DEFAULT).Info("worker_instance_id found in SSE annotations",
-							"worker_instance_id", wid,
-							"processing_time_ms", time.Since(startTime).Milliseconds())
+						logger.V(logutil.DEFAULT).Info("Dynamo worker_instance_id found in SSE annotations",
+							"worker_instance_id", wid)
 						return wid, false, nil
 					}
 				}
@@ -762,17 +745,15 @@ func (s *StreamingServer) callFrontEndForWorker(ctx context.Context, originalBod
 			if err == io.EOF {
 				// Process any pending event on EOF
 				if wid, done, _ := flushEvent(); wid != "" {
-					// All went well Returning the worker_instance_id
+					// All went well. Returning the worker_instance_id
 					return wid, nil
 				} else if done {
-					return "", fmt.Errorf("worker_instance_id not found before DONE")
+					return "", fmt.Errorf("Dynamo worker_instance_id not found before DONE")
 				}
-				logger.V(logutil.DEFAULT).Error(nil, "EOF before worker_instance_id",
-					"processing_time_ms", time.Since(startTime).Milliseconds())
+				logger.V(logutil.DEFAULT).Error(nil, "EOF before worker_instance_id")
 				return "", fmt.Errorf("worker_instance_id not found in SSE stream (EOF)")
 			}
-			logger.V(logutil.DEFAULT).Error(err, "SSE read error",
-				"processing_time_ms", time.Since(startTime).Milliseconds())
+			logger.V(logutil.DEFAULT).Error(err, "SSE read error")
 			return "", fmt.Errorf("sse read error: %w", err)
 		}
 
@@ -782,7 +763,7 @@ func (s *StreamingServer) callFrontEndForWorker(ctx context.Context, originalBod
 			if wid, done, _ := flushEvent(); wid != "" {
 				return wid, nil
 			} else if done {
-				return "", fmt.Errorf("worker_instance_id not found before DONE")
+				return "", fmt.Errorf("Dynamo worker_instance_id not found before DONE")
 			}
 			eventName = "" // reset for next event
 			continue
