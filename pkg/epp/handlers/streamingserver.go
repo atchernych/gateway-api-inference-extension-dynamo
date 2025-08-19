@@ -17,11 +17,14 @@ limitations under the License.
 package handlers
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"math/rand"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -362,6 +365,15 @@ func (s *StreamingServer) HandleRequestBody(
 		return reqCtx, errutil.Error{Code: errutil.Internal, Msg: fmt.Sprintf("error marshaling request body: %v", err)}
 	}
 
+	// Ask the Dynamo FrontEnd for worker selection.
+	if workerID, feErr := s.callFrontEndForWorker(ctx, requestBodyMap); feErr != nil {
+		// Proceed without a worker_instance_id if FrontEnd is unavailable.
+		logger.V(logutil.DEFAULT).Error(feErr, "FrontEnd call failed. Continuing without worker_instance_id")
+	} else if workerID != "" {
+		reqCtx.WorkerInstanceID = workerID
+		logger.V(logutil.VERBOSE).Info("Extracted worker instance ID from FrontEnd", "worker_instance_id", workerID)
+	}
+
 	target, err := s.scheduler.Schedule(ctx, llmReq)
 	if err != nil {
 		return reqCtx, errutil.Error{Code: errutil.InferencePoolResourceExhausted, Msg: fmt.Errorf("failed to find target pod: %w", err).Error()}
@@ -514,6 +526,24 @@ func (s *StreamingServer) populateRequestHeaderResponse(reqCtx *RequestContext, 
 			},
 		})
 	}
+	// Inject worker_instance_id reported by Dynamo router so the gateway can route to the chosen worker.
+	logger := log.Log.WithName("handlers").WithName("populateRequestHeaderResponse")
+	if reqCtx.WorkerInstanceID != "" {
+		headers = append(headers, &configPb.HeaderValueOption{
+			Header: &configPb.HeaderValue{
+				Key:      "x-worker-instance-id",
+				RawValue: []byte(reqCtx.WorkerInstanceID),
+			},
+		})
+		logger.V(logutil.VERBOSE).Info(
+			"Injected x-worker-instance-id header",
+			"worker_instance_id", reqCtx.WorkerInstanceID,
+		)
+	} else {
+		logger.V(logutil.VERBOSE).Info(
+			"Did not inject x-worker-instance-id header (empty worker id)",
+		)
+	}
 
 	targetEndpointValue := &structpb.Struct{
 		Fields: map[string]*structpb.Value{
@@ -550,6 +580,221 @@ func (s *StreamingServer) populateRequestHeaderResponse(reqCtx *RequestContext, 
 			},
 		},
 		DynamicMetadata: dynamicMetadata,
+	}
+}
+
+// Blocking call to the FrontEnd to obtain the Dynamo worker_instance_id for routing.
+func (s *StreamingServer) callFrontEndForWorker(ctx context.Context, originalBody map[string]interface{}) (string, error) {
+	logger := log.FromContext(ctx)
+	feURL := "http://127.0.0.1:8000/v1/chat/completions"
+
+	feBody := make(map[string]interface{}, len(originalBody)+1)
+	for k, v := range originalBody {
+		feBody[k] = v
+	}
+	// Make sure we send the streaming type request.
+	if _, ok := feBody["stream"]; !ok {
+		feBody["stream"] = true
+	}
+	nvext, _ := feBody["nvext"].(map[string]interface{})
+	if nvext == nil {
+		nvext = map[string]interface{}{}
+	}
+	var anns []string
+	switch v := nvext["annotations"].(type) {
+	case []string:
+		anns = append(anns, v...)
+	case []interface{}:
+		for _, x := range v {
+			if str, ok := x.(string); ok {
+				anns = append(anns, str)
+			}
+		}
+	}
+	needQueryInstanceID := "query_instance_id"
+	found := false
+	for _, a := range anns {
+		if a == needQueryInstanceID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		anns = append(anns, needQueryInstanceID)
+	}
+	nvext["annotations"] = anns
+	feBody["nvext"] = nvext
+
+	payload, err := json.Marshal(feBody)
+	if err != nil {
+		logger.V(logutil.DEFAULT).Error(err, "Dynamo FrontEnd marshal failed")
+		return "", fmt.Errorf("marshal FrontEnd body: %w", err)
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, feURL, bytes.NewReader(payload))
+	if err != nil {
+		logger.V(logutil.DEFAULT).Error(err, " Dynamo FrontEnd request build failed")
+		return "", fmt.Errorf("build FrontEnd request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+
+	client := &http.Client{Timeout: 0}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		logger.V(logutil.DEFAULT).Error(err, " Dynamo FrontEnd POST failed")
+		return "", fmt.Errorf("FrontEnd POST failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		errBody, _ := io.ReadAll(resp.Body)
+		logger.V(logutil.DEFAULT).Error(nil, "Dynamo FrontEnd non-2xx response",
+			"status_code", resp.StatusCode,
+			"response_body", string(errBody),
+		)
+		return "", fmt.Errorf("Dynamo FrontEnd error: %d body=%s", resp.StatusCode, string(errBody))
+	}
+
+	ct := strings.ToLower(resp.Header.Get("Content-Type"))
+	if !strings.Contains(ct, "text/event-stream") {
+		logger.V(logutil.DEFAULT).Error(nil, "Unexpected non-SSE response")
+		return "", fmt.Errorf("unexpected non-SSE response (Content-Type=%q)", resp.Header.Get("Content-Type"))
+	}
+
+	// We expect the information in the following format:
+	// event: worker_instance_id
+	// : "8303679623149182543"
+	//
+	// data: [DONE]
+	reader := bufio.NewReader(resp.Body)
+
+	var (
+		eventName  string
+		dataBuf    strings.Builder // accumulates one event's data: lines
+		commentBuf strings.Builder // accumulates one event's comment (":") lines
+	)
+
+	flushEvent := func() (string, bool, error) {
+		data := strings.TrimSpace(dataBuf.String())
+		comment := strings.TrimSpace(commentBuf.String())
+		dataBuf.Reset()
+		commentBuf.Reset()
+
+		// Handle [DONE]
+		if data == "[DONE]" || comment == "[DONE]" {
+			logger.V(logutil.DEFAULT).Info("SSE stream DONE")
+			return "", true, nil
+		}
+
+		// If this is the special event carrying the id by name, prefer its payload
+		if eventName == "worker_instance_id" {
+			// The Dynamo FrontEnd puts the id on a comment line, quoted:  : "8303..."
+			candidate := data
+			if candidate == "" {
+				candidate = comment
+			}
+			if candidate != "" {
+				// Try JSON string first (e.g. "8303679...")
+				var s string
+				if json.Unmarshal([]byte(candidate), &s) == nil && s != "" {
+					logger.V(logutil.VERBOSE).Info("Dynamo worker_instance_id extracted from named event",
+						"worker_instance_id", s)
+					return s, false, nil
+				}
+				// Fallback: raw strip quotes
+				clean := strings.Trim(candidate, "\"")
+				if clean != "" && clean != "[DONE]" {
+					logger.V(logutil.DEFAULT).Info("Dynamo worker_instance_id extracted (raw) from named event",
+						"worker_instance_id", clean)
+					return clean, false, nil
+				}
+			}
+		}
+
+		// Generic JSON object path (if someone sends data: {...})
+		if data != "" {
+			var msg map[string]interface{}
+			if json.Unmarshal([]byte(data), &msg) == nil {
+				// top-level
+				if wid, ok := msg["worker_instance_id"].(string); ok && wid != "" {
+					logger.V(logutil.DEFAULT).Info("Dynamo worker_instance_id found in SSE payload root",
+						"worker_instance_id", wid)
+					return wid, false, nil
+				}
+				// annotations map
+				if ann, ok := msg["annotations"].(map[string]interface{}); ok {
+					if wid, ok := ann["worker_instance_id"].(string); ok && wid != "" {
+						logger.V(logutil.DEFAULT).Info("Dynamo worker_instance_id found in SSE annotations",
+							"worker_instance_id", wid)
+						return wid, false, nil
+					}
+				}
+			}
+		}
+		return "", false, nil
+	}
+
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				// Process any pending event on EOF
+				if wid, done, _ := flushEvent(); wid != "" {
+					// All went well. Returning the worker_instance_id
+					return wid, nil
+				} else if done {
+					return "", fmt.Errorf("Dynamo worker_instance_id not found before DONE")
+				}
+				logger.V(logutil.DEFAULT).Error(nil, "EOF before worker_instance_id")
+				return "", fmt.Errorf("worker_instance_id not found in SSE stream (EOF)")
+			}
+			logger.V(logutil.DEFAULT).Error(err, "SSE read error")
+			return "", fmt.Errorf("sse read error: %w", err)
+		}
+
+		l := strings.TrimRight(line, "\r\n")
+		if l == "" {
+			// End of event: process accumulated buffers
+			if wid, done, _ := flushEvent(); wid != "" {
+				return wid, nil
+			} else if done {
+				return "", fmt.Errorf("Dynamo worker_instance_id not found before DONE")
+			}
+			eventName = "" // reset for next event
+			continue
+		}
+
+		// Comment line
+		if strings.HasPrefix(l, ":") {
+			commentLine := strings.TrimSpace(l[1:])
+			if commentBuf.Len() > 0 {
+				commentBuf.WriteByte('\n')
+			}
+			commentBuf.WriteString(commentLine)
+			continue
+		}
+
+		// field: value
+		if idx := strings.IndexByte(l, ':'); idx != -1 {
+			field := l[:idx]
+			val := strings.TrimSpace(l[idx+1:])
+			switch field {
+			case "event":
+				eventName = val
+			case "data":
+				if dataBuf.Len() > 0 {
+					dataBuf.WriteByte('\n')
+				}
+				dataBuf.WriteString(val)
+			default:
+				// ignore other fields (id, retry, etc.)
+			}
+		}
 	}
 }
 
