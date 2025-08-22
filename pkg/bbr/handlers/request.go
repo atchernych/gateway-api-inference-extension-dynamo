@@ -18,6 +18,7 @@ package handlers
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -36,6 +37,7 @@ const modelHeader = "X-Gateway-Model-Name"
 const (
 	workerIDHeader   = "x-worker-instance-id"
 	injectHintHeader = "x-epp-inject-nvext-worker-instance-id"
+	tokenDataHeader  = "x-epp-inject-nvext-token-data"
 )
 
 // HandleRequestBody handles request bodies.
@@ -54,6 +56,23 @@ func (s *Server) HandleRequestBody(ctx context.Context, data map[string]any) ([]
 		} else {
 			// if nvext was some other type, replace with a clean map
 			data["nvext"] = map[string]any{"backend_instance_id": wid}
+		}
+	}
+
+	// If we captured token_data in headers, decode and inject as nvext.token_data
+	if td := strings.TrimSpace(s.tokenDataHint); td != "" {
+		// header value is base64(JSON array)
+		if raw, err := base64.StdEncoding.DecodeString(td); err == nil {
+			var arr []int64
+			if err := json.Unmarshal(raw, &arr); err == nil && len(arr) > 0 {
+				// ensure nvext map exists
+				nv, ok := data["nvext"].(map[string]any)
+				if !ok || nv == nil {
+					nv = map[string]any{}
+					data["nvext"] = nv
+				}
+				nv["token_data"] = arr
+			}
 		}
 	}
 
@@ -216,20 +235,29 @@ func addStreamedBodyResponse(responses []*eppb.ProcessingResponse, requestBodyBy
 
 // HandleRequestHeaders handles request headers.
 func (s *Server) HandleRequestHeaders(headers *eppb.HttpHeaders) ([]*eppb.ProcessingResponse, error) {
-	// Look for our hint header and/or direct worker id header.
-	s.workerIDHint = "" // reset per request
+	// reset per-request
+	s.workerIDHint = ""
+	s.tokenDataHint = ""
+
 	if m := headers.GetHeaders(); m != nil {
 		for _, h := range m.GetHeaders() {
 			k := strings.ToLower(h.GetKey())
-			if k == injectHintHeader || k == workerIDHeader {
+
+			switch k {
+			case injectHintHeader, workerIDHeader:
+				// Prefer raw bytes if present; otherwise use value (Envoy can deliver either)
 				if rv := h.GetRawValue(); len(rv) > 0 {
 					s.workerIDHint = strings.TrimSpace(string(rv))
 				} else {
 					s.workerIDHint = strings.TrimSpace(h.GetValue())
 				}
-				// prefer the inject hint if both are present; break on the hint
-				if k == injectHintHeader {
-					break
+				// NOTE: don't return; we still want to scan for tokenDataHeader
+
+			case tokenDataHeader:
+				if rv := h.GetRawValue(); len(rv) > 0 {
+					s.tokenDataHint = strings.TrimSpace(string(rv))
+				} else {
+					s.tokenDataHint = strings.TrimSpace(h.GetValue())
 				}
 			}
 		}

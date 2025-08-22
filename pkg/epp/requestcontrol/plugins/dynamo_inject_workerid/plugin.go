@@ -15,6 +15,7 @@ const (
 	pluginName       = "dynamo-inject-workerid"
 	WorkerIDHeader   = "x-worker-instance-id"
 	injectHintHeader = "x-epp-inject-nvext-worker-instance-id"
+	TokenDataHeader  = "x-epp-inject-nvext-token-data"
 )
 
 var _ plugins.Plugin = (*InjectWorkerIDPreRequest)(nil)
@@ -59,4 +60,10 @@ func (p *InjectWorkerIDPreRequest) PreRequest(
 	}
 	req.Headers[WorkerIDHeader] = wid
 	req.Headers[injectHintHeader] = wid
+
+	// Pass through token-data header if scorer set it
+	if td := strings.TrimSpace(req.Headers[TokenDataHeader]); td != "" {
+		req.Headers[TokenDataHeader] = td
+	}
+
 }

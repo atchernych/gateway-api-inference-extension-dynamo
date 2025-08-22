@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -23,6 +24,7 @@ const (
 	KVAwareScorerType        = "kv-aware-scorer"
 	StateKeyWorkerInstanceID = schedtypes.StateKey("dynamo/worker-instance-id")
 	WorkerIDHeader           = "x-worker-instance-id"
+	TokenDataHeader          = "x-epp-inject-nvext-token-data"
 )
 
 type params struct {
@@ -84,7 +86,7 @@ func (k *KVAwareScorer) Score(
 ) map[schedtypes.Pod]float64 {
 	logger := log.FromContext(ctx)
 
-	workerID, err := k.callFrontEndForWorker(ctx, req)
+	workerID, tokenData, err := k.callFrontEndForWorker(ctx, req)
 	if err != nil {
 		logger.V(logutil.DEFAULT).Error(err, "FrontEnd call failed; proceeding without worker id")
 	} else if workerID != "" {
@@ -93,6 +95,12 @@ func (k *KVAwareScorer) Score(
 			req.Headers = map[string]string{}
 		}
 		req.Headers[WorkerIDHeader] = workerID
+		if len(tokenData) > 0 {
+			if req.Headers == nil {
+				req.Headers = map[string]string{}
+			}
+			req.Headers[TokenDataHeader] = encodeTokenData(tokenData)
+		}
 	}
 
 	// neutral/uniform scores – only your scorer runs in the profile, so this “wins”
@@ -107,14 +115,14 @@ func (k *KVAwareScorer) Score(
 func (k *KVAwareScorer) callFrontEndForWorker(
 	ctx context.Context,
 	req *schedtypes.LLMRequest,
-) (string, error) {
+) (string, []int64, error) {
 	logger := log.FromContext(ctx)
 
 	feBody := buildFrontEndBodyFromLLMRequest(req)
 	payload, err := json.Marshal(feBody)
 	if err != nil {
 		logger.V(logutil.DEFAULT).Error(err, "Dynamo FrontEnd marshal failed")
-		return "", fmt.Errorf("marshal FrontEnd body: %w", err)
+		return "", nil, fmt.Errorf("marshal FrontEnd body: %w", err)
 	}
 
 	reqCtx, cancel := context.WithTimeout(ctx, k.feTimeout)
@@ -123,7 +131,7 @@ func (k *KVAwareScorer) callFrontEndForWorker(
 	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, k.feURL, bytes.NewReader(payload))
 	if err != nil {
 		logger.V(logutil.DEFAULT).Error(err, "Dynamo FrontEnd request build failed")
-		return "", fmt.Errorf("build FrontEnd request: %w", err)
+		return "", nil, fmt.Errorf("build FrontEnd request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "text/event-stream")
@@ -132,7 +140,7 @@ func (k *KVAwareScorer) callFrontEndForWorker(
 	resp, err := client.Do(httpReq)
 	if err != nil {
 		logger.V(logutil.DEFAULT).Error(err, "Dynamo FrontEnd POST failed")
-		return "", fmt.Errorf("FrontEnd POST failed: %w", err)
+		return "", nil, fmt.Errorf("FrontEnd POST failed: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -140,22 +148,22 @@ func (k *KVAwareScorer) callFrontEndForWorker(
 		errBody, _ := io.ReadAll(resp.Body)
 		logger.V(logutil.DEFAULT).Error(nil, "Dynamo FrontEnd non-2xx response",
 			"status_code", resp.StatusCode, "response_body", string(errBody))
-		return "", fmt.Errorf("Dynamo FrontEnd error: %d body=%s", resp.StatusCode, string(errBody))
+		return "", nil, fmt.Errorf("Dynamo FrontEnd error: %d body=%s", resp.StatusCode, string(errBody))
 	}
 
 	ct := strings.ToLower(resp.Header.Get("Content-Type"))
 	if !strings.Contains(ct, "text/event-stream") {
 		logger.V(logutil.DEFAULT).Error(nil, "Unexpected non-SSE response")
-		return "", fmt.Errorf("unexpected non-SSE response (Content-Type=%q)", resp.Header.Get("Content-Type"))
+		return "", nil, fmt.Errorf("unexpected non-SSE response (Content-Type=%q)", resp.Header.Get("Content-Type"))
 	}
 
 	// Parse SSE: expect `event: worker_instance_id`, a quoted id in a comment or data, and `data: [DONE]`
 	reader := bufio.NewReader(resp.Body)
-	workerID, perr := parseWorkerIDFromSSE(ctx, reader)
+	workerID, tokenData, perr := parseSelectionFromSSE(ctx, reader)
 	if perr != nil {
-		return "", perr
+		return "", nil, perr
 	}
-	return workerID, nil
+	return workerID, tokenData, nil
 }
 
 // Build the exact body we send to the FrontEnd, only from LLMRequest (no header merging).
@@ -189,7 +197,7 @@ func buildFrontEndBodyFromLLMRequest(req *schedtypes.LLMRequest) map[string]any 
 	return feBody
 }
 
-// parseWorkerIDFromSSE scans an SSE stream for a worker_instance_id.
+// This function scans an SSE stream for a worker_instance_id and token_data.
 // Expected pattern:
 //
 //	event: worker_instance_id
@@ -198,16 +206,21 @@ func buildFrontEndBodyFromLLMRequest(req *schedtypes.LLMRequest) map[string]any 
 //
 // Also supports JSON in data lines with either top-level worker_instance_id
 // or annotations.worker_instance_id.
-func parseWorkerIDFromSSE(ctx context.Context, reader *bufio.Reader) (string, error) {
+func parseSelectionFromSSE(ctx context.Context, reader *bufio.Reader) (string, []int64, error) {
 	logger := log.FromContext(ctx)
 
 	var (
 		eventName  string
 		dataBuf    strings.Builder // accumulates "data:" lines for one event
 		commentBuf strings.Builder // accumulates ":" comment lines
+		gotWID     string
+		gotTD      []int64
 	)
 
-	flushEvent := func() (string, bool, error) {
+	// collect the exact SSE bytes for debugging
+	var rawBuf strings.Builder
+
+	flushEvent := func() (bool, error) {
 		data := strings.TrimSpace(dataBuf.String())
 		comment := strings.TrimSpace(commentBuf.String())
 		dataBuf.Reset()
@@ -216,7 +229,11 @@ func parseWorkerIDFromSSE(ctx context.Context, reader *bufio.Reader) (string, er
 		// [DONE] ends the stream
 		if data == "[DONE]" || comment == "[DONE]" {
 			logger.V(logutil.DEFAULT).Info("SSE stream DONE")
-			return "", true, nil
+			logger.V(logutil.DEFAULT).Info("SSE raw stream", "raw", rawBuf.String())
+			if gotWID != "" && len(gotTD) == 0 {
+				logger.V(logutil.DEFAULT).Info("SSE DONE: worker_instance_id present, token_data missing")
+			}
+			return true, nil
 		}
 
 		// Prefer the named event
@@ -230,60 +247,93 @@ func parseWorkerIDFromSSE(ctx context.Context, reader *bufio.Reader) (string, er
 				var s string
 				if json.Unmarshal([]byte(candidate), &s) == nil && s != "" {
 					logger.V(logutil.VERBOSE).Info("worker_instance_id extracted from named event", "worker_instance_id", s)
-					return s, false, nil
+					gotWID = s
+					return false, nil
 				}
 				// Fallback: strip quotes
 				clean := strings.Trim(candidate, "\"")
 				if clean != "" && clean != "[DONE]" {
 					logger.V(logutil.DEFAULT).Info("worker_instance_id extracted (raw) from named event", "worker_instance_id", clean)
-					return clean, false, nil
+					gotWID = clean
+					return false, nil
 				}
 			}
 		}
 
+		if eventName == "token_data" {
+			candidate := data
+			if candidate == "" {
+				candidate = comment
+			}
+			if candidate != "" {
+				if arr := toInt64SliceJSON(candidate); len(arr) > 0 {
+					gotTD = arr
+					logger.V(logutil.DEFAULT).Info("token_data extracted from named event", "count", len(arr))
+					return false, nil
+				}
+			}
+		}
 		// Generic JSON in data:
 		if data != "" {
 			var msg map[string]any
 			if json.Unmarshal([]byte(data), &msg) == nil {
 				if wid, ok := msg["worker_instance_id"].(string); ok && wid != "" {
 					logger.V(logutil.DEFAULT).Info("worker_instance_id found in SSE payload root", "worker_instance_id", wid)
-					return wid, false, nil
+					gotWID = wid
 				}
 				if ann, ok := msg["annotations"].(map[string]any); ok {
 					if wid, ok := ann["worker_instance_id"].(string); ok && wid != "" {
 						logger.V(logutil.DEFAULT).Info("worker_instance_id found in SSE annotations", "worker_instance_id", wid)
-						return wid, false, nil
+						gotWID = wid
+					}
+				}
+				if td, ok := msg["token_data"]; ok {
+					if arr := toInt64Slice(td); len(arr) > 0 {
+						gotTD = arr
+						logger.V(logutil.DEFAULT).Info("token_data found in SSE payload root", "count", len(arr))
+					}
+				} else if nv, ok := msg["nvext"].(map[string]any); ok {
+					if td, ok := nv["token_data"]; ok {
+						if arr := toInt64Slice(td); len(arr) > 0 {
+							gotTD = arr
+							logger.V(logutil.DEFAULT).Info("token_data found in SSE nvext", "count", len(arr))
+						}
 					}
 				}
 			}
 		}
-		return "", false, nil
+		return false, nil
 	}
 
 	for {
 		line, err := reader.ReadString('\n')
+		// capture the raw stream as-is for debugging
+		rawBuf.WriteString(line)
 		if err != nil {
 			if err == io.EOF {
-				// Flush any pending event on EOF
-				if wid, done, _ := flushEvent(); wid != "" {
-					return wid, nil
-				} else if done {
-					return "", fmt.Errorf("worker_instance_id not found before DONE")
+				_, _ = flushEvent()
+				logger.V(logutil.DEFAULT).Info("SSE raw stream (EOF)", "raw", rawBuf.String())
+				if gotWID != "" && len(gotTD) == 0 {
+					logger.V(logutil.DEFAULT).Info("EOF: worker_instance_id present, token_data missing")
 				}
-				logger.V(logutil.DEFAULT).Error(nil, "EOF before worker_instance_id")
-				return "", fmt.Errorf("worker_instance_id not found in SSE stream (EOF)")
+				if gotWID != "" || len(gotTD) > 0 {
+					return gotWID, gotTD, nil
+				}
+				logger.V(logutil.DEFAULT).Error(nil, "EOF before selection fields present")
+				return "", nil, fmt.Errorf("selection not found in SSE stream (EOF)")
 			}
 			logger.V(logutil.DEFAULT).Error(err, "SSE read error")
-			return "", fmt.Errorf("sse read error: %w", err)
+			return "", nil, fmt.Errorf("sse read error: %w", err)
 		}
 
 		l := strings.TrimRight(line, "\r\n")
 		if l == "" {
-			// End of current event; process it
-			if wid, done, _ := flushEvent(); wid != "" {
-				return wid, nil
-			} else if done {
-				return "", fmt.Errorf("worker_instance_id not found before DONE")
+			// End of current event.
+			if done, _ := flushEvent(); done {
+				if gotWID != "" && len(gotTD) == 0 {
+					logger.V(logutil.DEFAULT).Info("SSE DONE: worker_instance_id present, token_data missing")
+				}
+				return gotWID, gotTD, nil
 			}
 			eventName = "" // reset for next event
 			continue
@@ -316,4 +366,62 @@ func parseWorkerIDFromSSE(ctx context.Context, reader *bufio.Reader) (string, er
 			}
 		}
 	}
+}
+
+// encodeTokenData turns []int64 into base64(JSON array) for a safe header value.
+func encodeTokenData(tokens []int64) string {
+	b, _ := json.Marshal(tokens)
+	return base64.StdEncoding.EncodeToString(b)
+}
+
+// Accepts interface{} from a parsed JSON map
+func toInt64Slice(v any) []int64 {
+	xs, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]int64, 0, len(xs))
+	for _, it := range xs {
+		switch n := it.(type) {
+		case float64:
+			out = append(out, int64(n))
+		case int64:
+			out = append(out, n)
+		case json.Number:
+			if i, err := n.Int64(); err == nil {
+				out = append(out, i)
+			}
+		}
+	}
+	return out
+}
+
+// Accepts raw JSON (string) for events like:
+// event: worker_instance_id\n: \"8228244551594056720\"\n\n
+// event: token_data\n: \"[151644,872,198,151644,872,198,14990,151645,198,151645,198,151644,77091,198]\
+// "\n\ndata: [DONE]\n\n"
+// replaces the old toInt64SliceJSON
+func toInt64SliceJSON(s string) []int64 {
+	// case 1: direct JSON array
+	var arr []int64
+	if err := json.Unmarshal([]byte(s), &arr); err == nil && len(arr) > 0 {
+		return arr
+	}
+	// case 2: s is a JSON string that itself contains a JSON array
+	var inner string
+	if err := json.Unmarshal([]byte(s), &inner); err == nil && inner != "" {
+		var arr2 []int64
+		if err := json.Unmarshal([]byte(inner), &arr2); err == nil && len(arr2) > 0 {
+			return arr2
+		}
+	}
+	// case 3: strip quotes and try once more
+	unquoted := strings.Trim(s, "\"")
+	if unquoted != s {
+		var arr3 []int64
+		if err := json.Unmarshal([]byte(unquoted), &arr3); err == nil && len(arr3) > 0 {
+			return arr3
+		}
+	}
+	return nil
 }
