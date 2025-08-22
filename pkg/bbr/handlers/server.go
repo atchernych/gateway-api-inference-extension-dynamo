@@ -38,7 +38,8 @@ func NewServer(streaming bool) *Server {
 // Server implements the Envoy external processing server.
 // https://www.envoyproxy.io/docs/envoy/latest/api-v3/service/ext_proc/v3/external_processor.proto
 type Server struct {
-	streaming bool
+	streaming    bool
+	workerIDHint string
 }
 
 func (s *Server) Process(srv extProcPb.ExternalProcessor_ProcessServer) error {
