@@ -203,7 +203,11 @@ func buildFrontEndBodyFromLLMRequest(req *schedtypes.LLMRequest) map[string]any 
 //	event: worker_instance_id
 //	: "8303679623149182543"
 //	data: [DONE]
-//
+
+// or with tokens:
+// event: worker_instance_id\n: \"8228244551594056720\"\n\n
+// event: token_data\n: \"[151644,872,198,151644,872,198,14990,151645,198,151645,198,151644,77091,198]\
+// "\n\ndata: [DONE]\n\n"
 // Also supports JSON in data lines with either top-level worker_instance_id
 // or annotations.worker_instance_id.
 func parseSelectionFromSSE(ctx context.Context, reader *bufio.Reader) (string, []int64, error) {

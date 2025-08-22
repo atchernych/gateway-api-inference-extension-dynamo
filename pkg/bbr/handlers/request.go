@@ -245,14 +245,11 @@ func (s *Server) HandleRequestHeaders(headers *eppb.HttpHeaders) ([]*eppb.Proces
 
 			switch k {
 			case injectHintHeader, workerIDHeader:
-				// Prefer raw bytes if present; otherwise use value (Envoy can deliver either)
 				if rv := h.GetRawValue(); len(rv) > 0 {
 					s.workerIDHint = strings.TrimSpace(string(rv))
 				} else {
 					s.workerIDHint = strings.TrimSpace(h.GetValue())
 				}
-				// NOTE: don't return; we still want to scan for tokenDataHeader
-
 			case tokenDataHeader:
 				if rv := h.GetRawValue(); len(rv) > 0 {
 					s.tokenDataHint = strings.TrimSpace(string(rv))

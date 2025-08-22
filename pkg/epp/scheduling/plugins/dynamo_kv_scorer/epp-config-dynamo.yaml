@@ -1,3 +1,4 @@
+# This is an example for configuring the EPP to use the dynamo token-aware kv router for scoring the pods
 apiVersion: inference.networking.x-k8s.io/v1alpha1
 kind: EndpointPickerConfig
 plugins:
