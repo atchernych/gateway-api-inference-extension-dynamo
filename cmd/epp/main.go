@@ -32,6 +32,8 @@ import (
 func main() {
 	// Register all known plugin factories
 	runner.RegisterAllPlugins()
+	// For adding out-of-tree plugins to the plugins registry, use the following:
+	// plugins.Register(my-out-of-tree-plugin-name, my-out-of-tree-plugin-factory-function)
 
 	eppplugins.Register("dynamo-inject-workerid", dynprereq.InjectWorkerIDPreRequestFactory)
 	eppplugins.Register("kv-aware-scorer", dynscorer.KVAwareScorerFactory)
