@@ -22,6 +22,11 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	"sigs.k8s.io/gateway-api-inference-extension/cmd/epp/runner"
+	eppplugins "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/plugins"
+
+	// Dynamo plugins
+	dynprereq "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/requestcontrol/plugins/dynamo_inject_workerid"
+	dynscorer "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/scheduling/plugins/dynamo_kv_scorer"
 )
 
 func main() {
@@ -29,6 +34,9 @@ func main() {
 	runner.RegisterAllPlugins()
 	// For adding out-of-tree plugins to the plugins registry, use the following:
 	// plugins.Register(my-out-of-tree-plugin-name, my-out-of-tree-plugin-factory-function)
+
+	eppplugins.Register("dynamo-inject-workerid", dynprereq.InjectWorkerIDPreRequestFactory)
+	eppplugins.Register("kv-aware-scorer", dynscorer.KVAwareScorerFactory)
 
 	if err := runner.NewRunner().Run(ctrl.SetupSignalHandler()); err != nil {
 		os.Exit(1)
