@@ -30,7 +30,7 @@ import (
 )
 
 func main() {
-	// Register built-in plugins.
+	// Register all known plugin factories
 	runner.RegisterAllPlugins()
 
 	eppplugins.Register("dynamo-inject-workerid", dynprereq.InjectWorkerIDPreRequestFactory)
