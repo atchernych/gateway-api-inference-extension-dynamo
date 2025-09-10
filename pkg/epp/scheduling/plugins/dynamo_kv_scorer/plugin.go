@@ -1,5 +1,12 @@
 package dynamo_kv_scorer
 
+/*
+#cgo CFLAGS: -I${SRCDIR}/include
+#cgo LDFLAGS: ${SRCDIR}/lib/libdynamo_llm_capi.a -ldl -lpthread -lm -lstdc++
+#include "dynamo_simple.h"
+*/
+import "C"
+
 import (
 	"bufio"
 	"bytes"
@@ -9,8 +16,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
+	"sync"
 	"time"
+	"unsafe"
 
 	log "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/plugins"
@@ -26,6 +36,9 @@ const (
 	WorkerIDHeader           = "x-worker-instance-id"
 	TokenDataHeader          = "x-epp-inject-nvext-token-data"
 )
+
+var warmupOnce sync.Once
+var warmupErr error
 
 type params struct {
 	FrontendURL string `json:"frontendURL"`
@@ -73,7 +86,18 @@ func KVAwareScorerFactory(name string, raw json.RawMessage, _ plugins.Handle) (p
 	if timeout <= 0 {
 		timeout = 10 * time.Second
 	}
-	return NewKVAwareScorer().WithName(name).WithFrontend(p.FrontendURL, timeout), nil
+
+	s := NewKVAwareScorer().WithName(name).WithFrontend(p.FrontendURL, timeout)
+
+	// For the Dynamo Router Library
+	warmupOnce.Do(func() {
+		warmupErr = initFFI()
+	})
+	if warmupErr != nil {
+		return nil, fmt.Errorf("Dynamo FFI init for the Router failed: %w", warmupErr)
+	}
+
+	return s, nil
 }
 
 func (k *KVAwareScorer) TypedName() plugins.TypedName { return k.typedName }
@@ -86,10 +110,17 @@ func (k *KVAwareScorer) Score(
 ) map[schedtypes.Pod]float64 {
 	logger := log.FromContext(ctx)
 
-	workerID, tokenData, err := k.callFrontEndForWorker(ctx, req)
+	initFFI()
+	workerID, tokenData, err := k.callDynamoRouter(ctx, req)
 	if err != nil {
-		logger.V(logutil.DEFAULT).Error(err, "FrontEnd call failed; proceeding without worker id")
+		logger.V(logutil.DEFAULT).Error(err, "Dynamo call failed; proceeding without worker id")
 	} else if workerID != "" {
+		logger.V(logutil.DEFAULT).Info(
+			"Dynamo router selected worker",
+			"workerID", workerID,
+			"tokenDataCount", len(tokenData),
+			"tokenData", tokenData,
+		)
 		cycle.Write(StateKeyWorkerInstanceID, stateString(workerID))
 		if req.Headers == nil {
 			req.Headers = map[string]string{}
@@ -428,4 +459,140 @@ func toInt64SliceJSON(s string) []int64 {
 		}
 	}
 	return nil
+}
+
+// Integration with the Dynamo Router
+
+// ---- One-time FFI init (adjust to your deployment) ----
+
+var (
+	ffiOnce sync.Once
+	ffiErr  error
+
+	// Configuration loaded from environment variables
+	ffiNamespace string
+	ffiComponent string
+	ffiWorkerID  int64
+	ffiKvBlkSize uint32
+)
+
+// Load configuration from environment variables
+func loadDynamoConfig() {
+	// Set defaults
+	ffiNamespace = getEnvOrDefault("DYNAMO_NAMESPACE", "default")
+	ffiComponent = getEnvOrDefault("DYNAMO_COMPONENT", "my-model")
+	ffiWorkerID = getEnvInt64OrDefault("DYNAMO_WORKER_ID", 1)
+	ffiKvBlkSize = uint32(getEnvInt64OrDefault("DYNAMO_KV_BLOCK_SIZE", 32))
+}
+
+func getEnvOrDefault(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+func getEnvInt64OrDefault(key string, defaultValue int64) int64 {
+	if value := os.Getenv(key); value != "" {
+		if parsed, err := fmt.Sscanf(value, "%d", &defaultValue); err == nil && parsed == 1 {
+			return defaultValue
+		}
+	}
+	return defaultValue
+}
+
+// Call this once in your plugin setup (or lazily before first route call)
+func initFFI() error {
+	ffiOnce.Do(func() {
+		// Load configuration from environment
+		loadDynamoConfig()
+
+		ns := C.CString(ffiNamespace)
+		cm := C.CString(ffiComponent)
+		defer C.free(unsafe.Pointer(ns))
+		defer C.free(unsafe.Pointer(cm))
+
+		// Bring up runtime + publisher (safe even if you only query)
+		if C.dynamo_llm_init(ns, cm, C.longlong(ffiWorkerID), C.uint(ffiKvBlkSize)) != C.OK {
+			ffiErr = fmt.Errorf("dynamo_llm_init failed")
+			return
+		}
+		// Initialize router (with defaults)
+		if C.dynamo_kv_router_init(ns, cm, C.uint(ffiKvBlkSize)) != C.OK {
+			ffiErr = fmt.Errorf("dynamo_kv_router_init failed")
+			return
+		}
+	})
+	return ffiErr
+}
+
+func defaultRouterOverride() *C.struct_DynamoRouterConfigOverride {
+	// No overrides: both has_* = false; numeric fields ignored.
+	// TODO: where can I read these from?
+	cfg := C.struct_DynamoRouterConfigOverride{
+		has_overlap_score_weight: C.bool(false),
+		overlap_score_weight:     C.double(0),
+		has_router_temperature:   C.bool(false),
+		router_temperature:       C.double(0),
+	}
+	return &cfg
+}
+
+// Uses FFI to get (worker_instance_id, tokens) in-process.
+// Use this as an alternative to making the call over HTTP with the k.callFrontEndForWorker
+func (k *KVAwareScorer) callDynamoRouter(
+	ctx context.Context,
+	req *schedtypes.LLMRequest,
+) (string, []int64, error) {
+	logger := log.FromContext(ctx)
+
+	if err := initFFI(); err != nil {
+		logger.V(logutil.DEFAULT).Error(err, "FFI init failed")
+		return "", nil, err
+	}
+
+	// contextID should be unique per request. If your framework has one, use it.
+	// Otherwise fall back to a deterministic hash or a random UUID.
+	contextID := req.RequestId
+	if contextID == "" {
+		contextID = "gaie-epp" // TODO: replace with your request-id/trace-id
+	}
+	prompt := req.Prompt
+
+	cCtx := C.CString(contextID)
+	cPrm := C.CString(prompt)
+	defer C.free(unsafe.Pointer(cCtx))
+	defer C.free(unsafe.Pointer(cPrm))
+
+	var cWorker C.longlong
+	var cTokens *C.uint
+	var cCount C.ulong // uintptr_t in header; maps to C.ulong here
+
+	cfg := defaultRouterOverride()
+	rc := C.dynamo_kv_router_query_instance_id_with_config(
+		cCtx,
+		cPrm,
+		cfg,
+		&cWorker,
+		&cTokens,
+		&cCount,
+	)
+	if rc != C.OK {
+		return "", nil, fmt.Errorf("dynamo_kv_router_query_instance_id failed")
+	}
+
+	// Copy tokens into Go memory then free C memory immediately
+	count := int(uintptr(cCount))
+	var tokens64 []int64
+	if count > 0 && cTokens != nil {
+		src := unsafe.Slice((*uint32)(unsafe.Pointer(cTokens)), count)
+		tokens64 = make([]int64, count)
+		for i := 0; i < count; i++ {
+			tokens64[i] = int64(src[i])
+		}
+		C.dynamo_kv_router_free_tokens((*C.uint)(cTokens))
+	}
+
+	workerID := fmt.Sprintf("%d", int64(cWorker))
+	return workerID, tokens64, nil
 }
