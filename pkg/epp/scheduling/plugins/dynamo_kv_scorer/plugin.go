@@ -1,9 +1,67 @@
 package dynamo_kv_scorer
 
 /*
-#cgo CFLAGS: -I${SRCDIR}/include
-#cgo LDFLAGS: ${SRCDIR}/lib/libdynamo_llm_capi.a -ldl -lpthread -lm -lstdc++
-#include "dynamo_simple.h"
+#cgo CPPFLAGS: -I${SRCDIR}/include
+#cgo CXXFLAGS: -std=c++17
+#cgo LDFLAGS: ${SRCDIR}/lib/libdynamo_llm_capi.a -lstdc++ -ldl -lpthread -lm
+
+#include <stdint.h>
+#include <stddef.h>
+#include <stdlib.h>   // for free
+#include <stdbool.h>
+
+// enum underlying type is uint32_t; matches cbindgen output
+typedef uint32_t dynamo_llm_result_t;
+enum { DYNAMO_OK = 0, DYNAMO_ERR = 1 };
+
+// opaque handle forward-decl
+struct WorkerSelectionPipeline;
+typedef struct WorkerSelectionPipeline WorkerSelectionPipeline;
+
+// Prototypes (C-compatible)
+dynamo_llm_result_t dynamo_llm_init(const char *namespace_c_str,
+                                    const char *component_c_str,
+                                    int64_t worker_id,
+                                    uint32_t kv_block_size);
+
+dynamo_llm_result_t dynamo_llm_shutdown(void);
+dynamo_llm_result_t dynamo_llm_load_publisher_create(void);
+
+dynamo_llm_result_t dynamo_kv_event_publish_stored(uint64_t event_id,
+                                                   const uint32_t *token_ids,
+                                                   const uintptr_t *num_block_tokens,
+                                                   const uint64_t *block_ids,
+                                                   size_t num_blocks,
+                                                   const uint64_t *parent_hash,
+                                                   uint64_t lora_id);
+
+dynamo_llm_result_t dynamo_kv_event_publish_removed(uint64_t event_id,
+                                                    const uint64_t *block_ids,
+                                                    size_t num_blocks);
+
+dynamo_llm_result_t dynamo_create_worker_selection_pipeline(const char *namespace_c_str,
+                                                            const char *component_c_str,
+                                                            const char *model_name_c_str,
+                                                            bool use_kv_routing,
+                                                            double busy_threshold,
+                                                            double overlap_score_weight,
+                                                            double router_temperature,
+                                                            bool use_kv_events,
+                                                            bool router_replica_sync,
+                                                            WorkerSelectionPipeline **pipeline_out);
+
+dynamo_llm_result_t dynamo_destroy_worker_selection_pipeline(WorkerSelectionPipeline *pipeline);
+
+dynamo_llm_result_t dynamo_query_worker_selection_and_annotate(WorkerSelectionPipeline *pipeline,
+                                                               const char *request_json_c_str,
+                                                               int64_t *worker_instance_id_out,
+                                                               uint32_t **token_ids_out,
+                                                               size_t *token_count_out,
+                                                               char **annotated_request_json_out);
+
+dynamo_llm_result_t dynamo_free_worker_selection_result(uint32_t *token_ids,
+                                                        size_t token_count,
+                                                        char *annotated_request_json);
 */
 import "C"
 
@@ -37,6 +95,8 @@ const (
 	TokenDataHeader          = "x-epp-inject-nvext-token-data"
 )
 
+// --------------------------- config / env ---------------------------
+
 var warmupOnce sync.Once
 var warmupErr error
 
@@ -45,7 +105,6 @@ type params struct {
 	TimeoutMS   int    `json:"timeoutMS"`
 }
 
-// tiny wrapper so we can store a string in CycleState
 type stateString string
 
 func (s stateString) Clone() schedtypes.StateData { return s }
@@ -56,7 +115,6 @@ type KVAwareScorer struct {
 	feTimeout time.Duration
 }
 
-// compile-time assertions
 var _ plugins.Plugin = (*KVAwareScorer)(nil)
 var _ framework.Scorer = (*KVAwareScorer)(nil)
 
@@ -89,12 +147,17 @@ func KVAwareScorerFactory(name string, raw json.RawMessage, _ plugins.Handle) (p
 
 	s := NewKVAwareScorer().WithName(name).WithFrontend(p.FrontendURL, timeout)
 
-	// For the Dynamo Router Library
+	// one-time FFI init (runtime + persistent pipeline)
 	warmupOnce.Do(func() {
+		defer func() {
+			if r := recover(); r != nil {
+				warmupErr = fmt.Errorf("Dynamo configuration error: %v", r)
+			}
+		}()
 		warmupErr = initFFI()
 	})
 	if warmupErr != nil {
-		return nil, fmt.Errorf("Dynamo FFI init for the Router failed: %w", warmupErr)
+		return nil, fmt.Errorf("!!! Dynamo FFI init for the Router failed: %w", warmupErr)
 	}
 
 	return s, nil
@@ -102,47 +165,8 @@ func KVAwareScorerFactory(name string, raw json.RawMessage, _ plugins.Handle) (p
 
 func (k *KVAwareScorer) TypedName() plugins.TypedName { return k.typedName }
 
-func (k *KVAwareScorer) Score(
-	ctx context.Context,
-	cycle *schedtypes.CycleState,
-	req *schedtypes.LLMRequest,
-	pods []schedtypes.Pod,
-) map[schedtypes.Pod]float64 {
-	logger := log.FromContext(ctx)
+// --------------------------- SSE helpers (unchanged) ---------------------------
 
-	initFFI()
-	workerID, tokenData, err := k.callDynamoRouter(ctx, req)
-	if err != nil {
-		logger.V(logutil.DEFAULT).Error(err, "Dynamo call failed; proceeding without worker id")
-	} else if workerID != "" {
-		logger.V(logutil.DEFAULT).Info(
-			"Dynamo router selected worker",
-			"workerID", workerID,
-			"tokenDataCount", len(tokenData),
-			"tokenData", tokenData,
-		)
-		cycle.Write(StateKeyWorkerInstanceID, stateString(workerID))
-		if req.Headers == nil {
-			req.Headers = map[string]string{}
-		}
-		req.Headers[WorkerIDHeader] = workerID
-		if len(tokenData) > 0 {
-			if req.Headers == nil {
-				req.Headers = map[string]string{}
-			}
-			req.Headers[TokenDataHeader] = encodeTokenData(tokenData)
-		}
-	}
-
-	// neutral/uniform scores – only your scorer runs in the profile, so this “wins”
-	out := make(map[schedtypes.Pod]float64, len(pods))
-	for _, p := range pods {
-		out[p] = 1.0
-	}
-	return out
-}
-
-// Call the Dynamo FrontEnd and extract worker_instance_id via SSE.
 func (k *KVAwareScorer) callFrontEndForWorker(
 	ctx context.Context,
 	req *schedtypes.LLMRequest,
@@ -188,7 +212,6 @@ func (k *KVAwareScorer) callFrontEndForWorker(
 		return "", nil, fmt.Errorf("unexpected non-SSE response (Content-Type=%q)", resp.Header.Get("Content-Type"))
 	}
 
-	// Parse SSE: expect `event: worker_instance_id`, a quoted id in a comment or data, and `data: [DONE]`
 	reader := bufio.NewReader(resp.Body)
 	workerID, tokenData, perr := parseSelectionFromSSE(ctx, reader)
 	if perr != nil {
@@ -197,62 +220,31 @@ func (k *KVAwareScorer) callFrontEndForWorker(
 	return workerID, tokenData, nil
 }
 
-// Build the exact body we send to the FrontEnd, only from LLMRequest (no header merging).
 func buildFrontEndBodyFromLLMRequest(req *schedtypes.LLMRequest) map[string]any {
 	feBody := make(map[string]any, 8)
-
-	// We call /v1/chat/completions so must provide messages
 	userText := ""
 	if req != nil && strings.TrimSpace(req.Prompt) != "" {
 		userText = req.Prompt
 	}
-	feBody["messages"] = []map[string]any{
-		{"role": "user", "content": userText},
-	}
-
+	feBody["messages"] = []map[string]any{{"role": "user", "content": userText}}
 	if req != nil && strings.TrimSpace(req.TargetModel) != "" {
 		feBody["model"] = req.TargetModel
 	}
-
-	// Force SSE so we can parse worker_instance_id
 	feBody["stream"] = true
-
 	feBody["max_tokens"] = 1
 	feBody["temperature"] = 0.0
-
-	// Ask the Dynamo to include worker id
-	feBody["nvext"] = map[string]any{
-		"annotations": []string{"query_instance_id"},
-	}
-
 	return feBody
 }
 
-// This function scans an SSE stream for a worker_instance_id and token_data.
-// Expected pattern:
-//
-//	event: worker_instance_id
-//	: "8303679623149182543"
-//	data: [DONE]
-
-// or with tokens:
-// event: worker_instance_id\n: \"8228244551594056720\"\n\n
-// event: token_data\n: \"[151644,872,198,151644,872,198,14990,151645,198,151645,198,151644,77091,198]\
-// "\n\ndata: [DONE]\n\n"
-// Also supports JSON in data lines with either top-level worker_instance_id
-// or annotations.worker_instance_id.
 func parseSelectionFromSSE(ctx context.Context, reader *bufio.Reader) (string, []int64, error) {
 	logger := log.FromContext(ctx)
-
 	var (
 		eventName  string
-		dataBuf    strings.Builder // accumulates "data:" lines for one event
-		commentBuf strings.Builder // accumulates ":" comment lines
+		dataBuf    strings.Builder
+		commentBuf strings.Builder
 		gotWID     string
 		gotTD      []int64
 	)
-
-	// collect the exact SSE bytes for debugging
 	var rawBuf strings.Builder
 
 	flushEvent := func() (bool, error) {
@@ -261,7 +253,6 @@ func parseSelectionFromSSE(ctx context.Context, reader *bufio.Reader) (string, [
 		dataBuf.Reset()
 		commentBuf.Reset()
 
-		// [DONE] ends the stream
 		if data == "[DONE]" || comment == "[DONE]" {
 			logger.V(logutil.DEFAULT).Info("SSE stream DONE")
 			logger.V(logutil.DEFAULT).Info("SSE raw stream", "raw", rawBuf.String())
@@ -271,24 +262,19 @@ func parseSelectionFromSSE(ctx context.Context, reader *bufio.Reader) (string, [
 			return true, nil
 		}
 
-		// Prefer the named event
 		if eventName == "worker_instance_id" {
 			candidate := data
 			if candidate == "" {
 				candidate = comment
 			}
 			if candidate != "" {
-				// Try JSON string
 				var s string
 				if json.Unmarshal([]byte(candidate), &s) == nil && s != "" {
-					logger.V(logutil.VERBOSE).Info("worker_instance_id extracted from named event", "worker_instance_id", s)
 					gotWID = s
 					return false, nil
 				}
-				// Fallback: strip quotes
 				clean := strings.Trim(candidate, "\"")
 				if clean != "" && clean != "[DONE]" {
-					logger.V(logutil.DEFAULT).Info("worker_instance_id extracted (raw) from named event", "worker_instance_id", clean)
 					gotWID = clean
 					return false, nil
 				}
@@ -303,35 +289,30 @@ func parseSelectionFromSSE(ctx context.Context, reader *bufio.Reader) (string, [
 			if candidate != "" {
 				if arr := toInt64SliceJSON(candidate); len(arr) > 0 {
 					gotTD = arr
-					logger.V(logutil.DEFAULT).Info("token_data extracted from named event", "count", len(arr))
 					return false, nil
 				}
 			}
 		}
-		// Generic JSON in data:
+
 		if data != "" {
 			var msg map[string]any
 			if json.Unmarshal([]byte(data), &msg) == nil {
 				if wid, ok := msg["worker_instance_id"].(string); ok && wid != "" {
-					logger.V(logutil.DEFAULT).Info("worker_instance_id found in SSE payload root", "worker_instance_id", wid)
 					gotWID = wid
 				}
 				if ann, ok := msg["annotations"].(map[string]any); ok {
 					if wid, ok := ann["worker_instance_id"].(string); ok && wid != "" {
-						logger.V(logutil.DEFAULT).Info("worker_instance_id found in SSE annotations", "worker_instance_id", wid)
 						gotWID = wid
 					}
 				}
 				if td, ok := msg["token_data"]; ok {
 					if arr := toInt64Slice(td); len(arr) > 0 {
 						gotTD = arr
-						logger.V(logutil.DEFAULT).Info("token_data found in SSE payload root", "count", len(arr))
 					}
 				} else if nv, ok := msg["nvext"].(map[string]any); ok {
 					if td, ok := nv["token_data"]; ok {
 						if arr := toInt64Slice(td); len(arr) > 0 {
 							gotTD = arr
-							logger.V(logutil.DEFAULT).Info("token_data found in SSE nvext", "count", len(arr))
 						}
 					}
 				}
@@ -342,7 +323,6 @@ func parseSelectionFromSSE(ctx context.Context, reader *bufio.Reader) (string, [
 
 	for {
 		line, err := reader.ReadString('\n')
-		// capture the raw stream as-is for debugging
 		rawBuf.WriteString(line)
 		if err != nil {
 			if err == io.EOF {
@@ -363,18 +343,16 @@ func parseSelectionFromSSE(ctx context.Context, reader *bufio.Reader) (string, [
 
 		l := strings.TrimRight(line, "\r\n")
 		if l == "" {
-			// End of current event.
 			if done, _ := flushEvent(); done {
 				if gotWID != "" && len(gotTD) == 0 {
 					logger.V(logutil.DEFAULT).Info("SSE DONE: worker_instance_id present, token_data missing")
 				}
 				return gotWID, gotTD, nil
 			}
-			eventName = "" // reset for next event
+			eventName = ""
 			continue
 		}
 
-		// Comment line
 		if strings.HasPrefix(l, ":") {
 			commentLine := strings.TrimSpace(l[1:])
 			if commentBuf.Len() > 0 {
@@ -384,7 +362,6 @@ func parseSelectionFromSSE(ctx context.Context, reader *bufio.Reader) (string, [
 			continue
 		}
 
-		// "field: value"
 		if idx := strings.IndexByte(l, ':'); idx != -1 {
 			field := l[:idx]
 			val := strings.TrimSpace(l[idx+1:])
@@ -397,19 +374,16 @@ func parseSelectionFromSSE(ctx context.Context, reader *bufio.Reader) (string, [
 				}
 				dataBuf.WriteString(val)
 			default:
-				// ignore id, retry, etc.
 			}
 		}
 	}
 }
 
-// encodeTokenData turns []int64 into base64(JSON array) for a safe header value.
 func encodeTokenData(tokens []int64) string {
 	b, _ := json.Marshal(tokens)
 	return base64.StdEncoding.EncodeToString(b)
 }
 
-// Accepts interface{} from a parsed JSON map
 func toInt64Slice(v any) []int64 {
 	xs, ok := v.([]any)
 	if !ok {
@@ -431,18 +405,11 @@ func toInt64Slice(v any) []int64 {
 	return out
 }
 
-// Accepts raw JSON (string) for events like:
-// event: worker_instance_id\n: \"8228244551594056720\"\n\n
-// event: token_data\n: \"[151644,872,198,151644,872,198,14990,151645,198,151645,198,151644,77091,198]\
-// "\n\ndata: [DONE]\n\n"
-// replaces the old toInt64SliceJSON
 func toInt64SliceJSON(s string) []int64 {
-	// case 1: direct JSON array
 	var arr []int64
 	if err := json.Unmarshal([]byte(s), &arr); err == nil && len(arr) > 0 {
 		return arr
 	}
-	// case 2: s is a JSON string that itself contains a JSON array
 	var inner string
 	if err := json.Unmarshal([]byte(s), &inner); err == nil && inner != "" {
 		var arr2 []int64
@@ -450,7 +417,6 @@ func toInt64SliceJSON(s string) []int64 {
 			return arr2
 		}
 	}
-	// case 3: strip quotes and try once more
 	unquoted := strings.Trim(s, "\"")
 	if unquoted != s {
 		var arr3 []int64
@@ -461,85 +427,175 @@ func toInt64SliceJSON(s string) []int64 {
 	return nil
 }
 
-// Integration with the Dynamo Router
-
-// ---- One-time FFI init (adjust to your deployment) ----
+// --------------------------- FFI integration ---------------------------
 
 var (
 	ffiOnce sync.Once
 	ffiErr  error
 
-	// Configuration loaded from environment variables
-	ffiNamespace string
-	ffiComponent string
-	ffiWorkerID  int64
-	ffiKvBlkSize uint32
+	ffiNamespace          string
+	ffiComponent          string
+	ffiModel              string
+	ffiOverlapScoreWeight float64
+	ffiRouterTemperature  float64
+	ffiKvBlockSize        uint32
+	ffiWorkerID           int64
+
+	runtimeInitialized bool
+
+	// Boxed pipeline handle (owned on the Rust side, opaque here)
+	pipeline      *C.struct_WorkerSelectionPipeline
+	pipelineMutex sync.RWMutex
 )
 
-// Load configuration from environment variables
 func loadDynamoConfig() {
-	// Set defaults
-	ffiNamespace = getEnvOrDefault("DYNAMO_NAMESPACE", "default")
-	ffiComponent = getEnvOrDefault("DYNAMO_COMPONENT", "my-model")
+	ffiNamespace = getEnvOrDefault("DYNAMO_NAMESPACE", "vllm-agg")
+	ffiComponent = getEnvOrDefault("DYNAMO_COMPONENT", "backend")
+	ffiModel = getEnvOrDefault("DYNAMO_MODEL", "Qwen/Qwen3-0.6B")
 	ffiWorkerID = getEnvInt64OrDefault("DYNAMO_WORKER_ID", 1)
-	ffiKvBlkSize = uint32(getEnvInt64OrDefault("DYNAMO_KV_BLOCK_SIZE", 32))
-}
 
-func getEnvOrDefault(key, defaultValue string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
+	ffiOverlapScoreWeight = getEnvFloatOrDefault("DYNAMO_OVERLAP_SCORE_WEIGHT", -1.0)
+	ffiRouterTemperature = getEnvFloatOrDefault("DYNAMO_ROUTER_TEMPERATURE", -1.0)
+
+	kvBlockSizeStr := os.Getenv("DYNAMO_KV_BLOCK_SIZE")
+	if kvBlockSizeStr == "" {
+		panic("DYNAMO_KV_BLOCK_SIZE is required and must match the model card's kv_cache_block_size")
 	}
-	return defaultValue
+	var tmp int64
+	if n, err := fmt.Sscanf(kvBlockSizeStr, "%d", &tmp); err != nil || n != 1 {
+		panic(fmt.Sprintf("DYNAMO_KV_BLOCK_SIZE='%s' is not a valid integer", kvBlockSizeStr))
+	}
+	ffiKvBlockSize = uint32(tmp)
+	if ffiKvBlockSize < 16 || ffiKvBlockSize > 8192 {
+		panic(fmt.Sprintf("DYNAMO_KV_BLOCK_SIZE=%d outside [16,8192]", ffiKvBlockSize))
+	}
+	if (ffiKvBlockSize & (ffiKvBlockSize - 1)) != 0 {
+		panic(fmt.Sprintf("DYNAMO_KV_BLOCK_SIZE=%d must be a power of 2", ffiKvBlockSize))
+	}
+	fmt.Printf("Dynamo KV Scorer: Loaded DYNAMO_KV_BLOCK_SIZE=%d\n", ffiKvBlockSize)
 }
 
-func getEnvInt64OrDefault(key string, defaultValue int64) int64 {
-	if value := os.Getenv(key); value != "" {
-		if parsed, err := fmt.Sscanf(value, "%d", &defaultValue); err == nil && parsed == 1 {
-			return defaultValue
+func getEnvOrDefault(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+func getEnvInt64OrDefault(key string, def int64) int64 {
+	if v := os.Getenv(key); v != "" {
+		var p int64
+		if n, err := fmt.Sscanf(v, "%d", &p); err == nil && n == 1 {
+			return p
 		}
 	}
-	return defaultValue
+	return def
+}
+func getEnvFloatOrDefault(key string, def float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		var p float64
+		if n, err := fmt.Sscanf(v, "%f", &p); err == nil && n == 1 {
+			return p
+		}
+	}
+	return def
+}
+func getEnvBoolOrDefault(key string, def bool) bool {
+	if v := os.Getenv(key); v != "" {
+		switch strings.ToLower(v) {
+		case "true", "1", "yes", "on":
+			return true
+		case "false", "0", "no", "off":
+			return false
+		}
+	}
+	return def
 }
 
-// Call this once in your plugin setup (or lazily before first route call)
+// initFFI: initialize runtime and create a persistent boxed pipeline.
 func initFFI() error {
 	ffiOnce.Do(func() {
-		// Load configuration from environment
 		loadDynamoConfig()
 
 		ns := C.CString(ffiNamespace)
 		cm := C.CString(ffiComponent)
+		model := C.CString(ffiModel)
 		defer C.free(unsafe.Pointer(ns))
 		defer C.free(unsafe.Pointer(cm))
+		defer C.free(unsafe.Pointer(model))
 
-		// Bring up runtime + publisher (safe even if you only query)
-		if C.dynamo_llm_init(ns, cm, C.longlong(ffiWorkerID), C.uint(ffiKvBlkSize)) != C.OK {
+		// 1) runtime
+		if rc := C.dynamo_llm_init(ns, cm, C.int64_t(ffiWorkerID), C.uint32_t(ffiKvBlockSize)); rc != C.DYNAMO_OK {
 			ffiErr = fmt.Errorf("dynamo_llm_init failed")
 			return
 		}
-		// Initialize router (with defaults)
-		if C.dynamo_kv_router_init(ns, cm, C.uint(ffiKvBlkSize)) != C.OK {
-			ffiErr = fmt.Errorf("dynamo_kv_router_init failed")
+		runtimeInitialized = true
+
+		// 2) create persistent pipeline
+		pipelineMutex.Lock()
+		defer pipelineMutex.Unlock()
+
+		rc := C.dynamo_create_worker_selection_pipeline(
+			ns,
+			cm,
+			model,
+			C.bool(true),                    // use_kv_routing
+			C.double(-1.0),                  // busy_threshold (default)
+			C.double(ffiOverlapScoreWeight), // overlap_score_weight (neg = default)
+			C.double(ffiRouterTemperature),  // router_temperature (neg = default)
+			C.bool(getEnvBoolOrDefault("DYNAMO_USE_KV_EVENTS", true)),
+			C.bool(getEnvBoolOrDefault("DYNAMO_ROUTER_REPLICA_SYNC", false)),
+			&pipeline,
+		)
+		if rc != C.DYNAMO_OK {
+			ffiErr = fmt.Errorf("dynamo_create_worker_selection_pipeline failed")
 			return
 		}
 	})
 	return ffiErr
 }
 
-func defaultRouterOverride() *C.struct_DynamoRouterConfigOverride {
-	// No overrides: both has_* = false; numeric fields ignored.
-	// TODO: where can I read these from?
-	cfg := C.struct_DynamoRouterConfigOverride{
-		has_overlap_score_weight: C.bool(false),
-		overlap_score_weight:     C.double(0),
-		has_router_temperature:   C.bool(false),
-		router_temperature:       C.double(0),
+// --------------------------- scoring ---------------------------
+
+func (k *KVAwareScorer) Score(
+	ctx context.Context,
+	cycle *schedtypes.CycleState,
+	req *schedtypes.LLMRequest,
+	pods []schedtypes.Pod,
+) map[schedtypes.Pod]float64 {
+	logger := log.FromContext(ctx)
+
+	workerID, tokenData, err := k.callDynamoRouter(ctx, req)
+	if err != nil {
+		logger.V(logutil.DEFAULT).Error(err, "Dynamo call failed; proceeding without worker id")
+	} else if workerID != "" {
+		logger.V(logutil.DEFAULT).Info(
+			"Dynamo router selected worker",
+			"workerID", workerID,
+			"tokenDataCount", len(tokenData),
+			"tokenData", tokenData,
+		)
+		cycle.Write(StateKeyWorkerInstanceID, stateString(workerID))
+		if req.Headers == nil {
+			req.Headers = map[string]string{}
+		}
+		req.Headers[WorkerIDHeader] = workerID
+		if len(tokenData) > 0 {
+			if req.Headers == nil {
+				req.Headers = map[string]string{}
+			}
+			req.Headers[TokenDataHeader] = encodeTokenData(tokenData)
+		}
 	}
-	return &cfg
+
+	out := make(map[schedtypes.Pod]float64, len(pods))
+	for _, p := range pods {
+		out[p] = 1.0
+	}
+	return out
 }
 
-// Uses FFI to get (worker_instance_id, tokens) in-process.
-// Use this as an alternative to making the call over HTTP with the k.callFrontEndForWorker
+// --------------------------- router call (persistent only) ---------------------------
+
 func (k *KVAwareScorer) callDynamoRouter(
 	ctx context.Context,
 	req *schedtypes.LLMRequest,
@@ -550,39 +606,49 @@ func (k *KVAwareScorer) callDynamoRouter(
 		logger.V(logutil.DEFAULT).Error(err, "FFI init failed")
 		return "", nil, err
 	}
-
-	// contextID should be unique per request. If your framework has one, use it.
-	// Otherwise fall back to a deterministic hash or a random UUID.
-	contextID := req.RequestId
-	if contextID == "" {
-		contextID = "gaie-epp" // TODO: replace with your request-id/trace-id
+	if !runtimeInitialized {
+		return "", nil, fmt.Errorf("dynamo runtime not initialized")
 	}
-	prompt := req.Prompt
 
-	cCtx := C.CString(contextID)
-	cPrm := C.CString(prompt)
-	defer C.free(unsafe.Pointer(cCtx))
-	defer C.free(unsafe.Pointer(cPrm))
+	pipelineMutex.RLock()
+	currentPipeline := pipeline
+	pipelineMutex.RUnlock()
 
-	var cWorker C.longlong
-	var cTokens *C.uint
-	var cCount C.ulong // uintptr_t in header; maps to C.ulong here
+	if currentPipeline == nil {
+		return "", nil, fmt.Errorf("dynamo worker selection pipeline not created")
+	}
 
-	cfg := defaultRouterOverride()
-	rc := C.dynamo_kv_router_query_instance_id_with_config(
-		cCtx,
-		cPrm,
-		cfg,
-		&cWorker,
+	// Build OpenAI-compatible JSON request
+	requestBody := buildOpenAIRequest(req)
+	requestJSON, err := json.Marshal(requestBody)
+	if err != nil {
+		logger.V(logutil.DEFAULT).Error(err, "Failed to marshal OpenAI request")
+		return "", nil, fmt.Errorf("marshal OpenAI request: %w", err)
+	}
+	cRequestJSON := C.CString(string(requestJSON))
+	defer C.free(unsafe.Pointer(cRequestJSON))
+
+	// Output variables
+	var cWorkerID C.int64_t
+	var cTokens *C.uint32_t
+	var cTokenCount C.size_t
+	var cAnnotatedJSON *C.char
+
+	// Call the worker selection pipeline
+	rc := C.dynamo_query_worker_selection_and_annotate(
+		currentPipeline,
+		cRequestJSON,
+		&cWorkerID,
 		&cTokens,
-		&cCount,
+		&cTokenCount,
+		&cAnnotatedJSON,
 	)
-	if rc != C.OK {
-		return "", nil, fmt.Errorf("dynamo_kv_router_query_instance_id failed")
+	if rc != C.DYNAMO_OK {
+		return "", nil, fmt.Errorf("!!! dynamo_query_worker_selection_and_annotate failed")
 	}
 
-	// Copy tokens into Go memory then free C memory immediately
-	count := int(uintptr(cCount))
+	// Copy tokens into Go memory and free C memory
+	count := int(uintptr(cTokenCount))
 	var tokens64 []int64
 	if count > 0 && cTokens != nil {
 		src := unsafe.Slice((*uint32)(unsafe.Pointer(cTokens)), count)
@@ -590,9 +656,55 @@ func (k *KVAwareScorer) callDynamoRouter(
 		for i := 0; i < count; i++ {
 			tokens64[i] = int64(src[i])
 		}
-		C.dynamo_kv_router_free_tokens((*C.uint)(cTokens))
+	}
+	C.dynamo_free_worker_selection_result(cTokens, cTokenCount, cAnnotatedJSON)
+
+	workerID := fmt.Sprintf("%d", int64(cWorkerID))
+	logger.V(logutil.DEFAULT).Info("Worker selection completed",
+		"workerID", workerID, "tokenCount", count)
+
+	return workerID, tokens64, nil
+}
+
+func buildOpenAIRequest(req *schedtypes.LLMRequest) map[string]any {
+	requestBody := make(map[string]any)
+	userText := "default prompt"
+	if req != nil && strings.TrimSpace(req.Prompt) != "" {
+		userText = req.Prompt
+	}
+	requestBody["messages"] = []map[string]any{{"role": "user", "content": userText}}
+	if req != nil && strings.TrimSpace(req.TargetModel) != "" {
+		requestBody["model"] = req.TargetModel
+	} else {
+		requestBody["model"] = ffiModel
+	}
+	requestBody["max_tokens"] = 1
+	requestBody["temperature"] = 0.0
+	requestBody["stream"] = true
+	requestBody["nvext"] = map[string]any{
+		"annotations": []string{"query_instance_id"},
+	}
+	return requestBody
+}
+
+// --------------------------- shutdown ---------------------------
+
+func cleanupDynamo() error {
+	pipelineMutex.Lock()
+	defer pipelineMutex.Unlock()
+
+	if pipeline != nil {
+		if rc := C.dynamo_destroy_worker_selection_pipeline(pipeline); rc != C.DYNAMO_OK {
+			fmt.Printf("Warning: dynamo_destroy_worker_selection_pipeline failed\n")
+		}
+		pipeline = nil
 	}
 
-	workerID := fmt.Sprintf("%d", int64(cWorker))
-	return workerID, tokens64, nil
+	if runtimeInitialized {
+		if rc := C.dynamo_llm_shutdown(); rc != C.DYNAMO_OK {
+			return fmt.Errorf("dynamo_llm_shutdown failed")
+		}
+		runtimeInitialized = false
+	}
+	return nil
 }
