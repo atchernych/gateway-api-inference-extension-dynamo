@@ -132,7 +132,7 @@ func KVAwareScorerFactory(name string, raw json.RawMessage, _ plugins.Handle) (p
 		warmupErr = initFFI()
 	})
 	if warmupErr != nil {
-		return nil, fmt.Errorf("!!! Dynamo FFI init for the Router failed: %w", warmupErr)
+		return nil, fmt.Errorf("Dynamo FFI init for the Router failed: %w", warmupErr)
 	}
 
 	return s, nil
@@ -362,7 +362,7 @@ func (k *KVAwareScorer) callDynamoRouter(
 		&cAnnotatedJSON,
 	)
 	if rc != C.DYNAMO_OK {
-		return "", nil, fmt.Errorf("!!! dynamo_query_worker_selection_and_annotate failed")
+		return "", nil, fmt.Errorf("dynamo_query_worker_selection_and_annotate failed")
 	}
 
 	// Copy tokens into Go memory and free C memory
