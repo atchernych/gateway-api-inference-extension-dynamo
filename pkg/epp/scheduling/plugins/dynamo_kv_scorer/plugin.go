@@ -66,18 +66,13 @@ dynamo_llm_result_t dynamo_free_worker_selection_result(uint32_t *token_ids,
 import "C"
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"strings"
 	"sync"
-	"time"
 	"unsafe"
 
 	log "sigs.k8s.io/controller-runtime/pkg/log"
@@ -100,19 +95,14 @@ const (
 var warmupOnce sync.Once
 var warmupErr error
 
-type params struct {
-	FrontendURL string `json:"frontendURL"`
-	TimeoutMS   int    `json:"timeoutMS"`
-}
-
 type stateString string
+type params struct {
+}
 
 func (s stateString) Clone() schedtypes.StateData { return s }
 
 type KVAwareScorer struct {
 	typedName plugins.TypedName
-	feURL     string
-	feTimeout time.Duration
 }
 
 var _ plugins.Plugin = (*KVAwareScorer)(nil)
@@ -121,31 +111,16 @@ var _ framework.Scorer = (*KVAwareScorer)(nil)
 func NewKVAwareScorer() *KVAwareScorer {
 	return &KVAwareScorer{
 		typedName: plugins.TypedName{Type: KVAwareScorerType, Name: PluginName},
-		feURL:     "http://127.0.0.1:8000/v1/chat/completions",
-		feTimeout: 10 * time.Second,
 	}
 }
 
 func (k *KVAwareScorer) WithName(name string) *KVAwareScorer { k.typedName.Name = name; return k }
-func (k *KVAwareScorer) WithFrontend(url string, timeout time.Duration) *KVAwareScorer {
-	if url != "" {
-		k.feURL = url
-	}
-	if timeout > 0 {
-		k.feTimeout = timeout
-	}
-	return k
-}
 
 func KVAwareScorerFactory(name string, raw json.RawMessage, _ plugins.Handle) (plugins.Plugin, error) {
 	p := params{}
 	_ = json.Unmarshal(raw, &p)
-	timeout := time.Duration(p.TimeoutMS) * time.Millisecond
-	if timeout <= 0 {
-		timeout = 10 * time.Second
-	}
 
-	s := NewKVAwareScorer().WithName(name).WithFrontend(p.FrontendURL, timeout)
+	s := NewKVAwareScorer().WithName(name)
 
 	// one-time FFI init (runtime + persistent pipeline)
 	warmupOnce.Do(func() {
@@ -164,268 +139,6 @@ func KVAwareScorerFactory(name string, raw json.RawMessage, _ plugins.Handle) (p
 }
 
 func (k *KVAwareScorer) TypedName() plugins.TypedName { return k.typedName }
-
-// --------------------------- SSE helpers (unchanged) ---------------------------
-
-func (k *KVAwareScorer) callFrontEndForWorker(
-	ctx context.Context,
-	req *schedtypes.LLMRequest,
-) (string, []int64, error) {
-	logger := log.FromContext(ctx)
-
-	feBody := buildFrontEndBodyFromLLMRequest(req)
-	payload, err := json.Marshal(feBody)
-	if err != nil {
-		logger.V(logutil.DEFAULT).Error(err, "Dynamo FrontEnd marshal failed")
-		return "", nil, fmt.Errorf("marshal FrontEnd body: %w", err)
-	}
-
-	reqCtx, cancel := context.WithTimeout(ctx, k.feTimeout)
-	defer cancel()
-
-	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, k.feURL, bytes.NewReader(payload))
-	if err != nil {
-		logger.V(logutil.DEFAULT).Error(err, "Dynamo FrontEnd request build failed")
-		return "", nil, fmt.Errorf("build FrontEnd request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "text/event-stream")
-
-	client := &http.Client{Timeout: 0}
-	resp, err := client.Do(httpReq)
-	if err != nil {
-		logger.V(logutil.DEFAULT).Error(err, "Dynamo FrontEnd POST failed")
-		return "", nil, fmt.Errorf("FrontEnd POST failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		errBody, _ := io.ReadAll(resp.Body)
-		logger.V(logutil.DEFAULT).Error(nil, "Dynamo FrontEnd non-2xx response",
-			"status_code", resp.StatusCode, "response_body", string(errBody))
-		return "", nil, fmt.Errorf("Dynamo FrontEnd error: %d body=%s", resp.StatusCode, string(errBody))
-	}
-
-	ct := strings.ToLower(resp.Header.Get("Content-Type"))
-	if !strings.Contains(ct, "text/event-stream") {
-		logger.V(logutil.DEFAULT).Error(nil, "Unexpected non-SSE response")
-		return "", nil, fmt.Errorf("unexpected non-SSE response (Content-Type=%q)", resp.Header.Get("Content-Type"))
-	}
-
-	reader := bufio.NewReader(resp.Body)
-	workerID, tokenData, perr := parseSelectionFromSSE(ctx, reader)
-	if perr != nil {
-		return "", nil, perr
-	}
-	return workerID, tokenData, nil
-}
-
-func buildFrontEndBodyFromLLMRequest(req *schedtypes.LLMRequest) map[string]any {
-	feBody := make(map[string]any, 8)
-	userText := ""
-	if req != nil && strings.TrimSpace(req.Prompt) != "" {
-		userText = req.Prompt
-	}
-	feBody["messages"] = []map[string]any{{"role": "user", "content": userText}}
-	if req != nil && strings.TrimSpace(req.TargetModel) != "" {
-		feBody["model"] = req.TargetModel
-	}
-	feBody["stream"] = true
-	feBody["max_tokens"] = 1
-	feBody["temperature"] = 0.0
-	return feBody
-}
-
-func parseSelectionFromSSE(ctx context.Context, reader *bufio.Reader) (string, []int64, error) {
-	logger := log.FromContext(ctx)
-	var (
-		eventName  string
-		dataBuf    strings.Builder
-		commentBuf strings.Builder
-		gotWID     string
-		gotTD      []int64
-	)
-	var rawBuf strings.Builder
-
-	flushEvent := func() (bool, error) {
-		data := strings.TrimSpace(dataBuf.String())
-		comment := strings.TrimSpace(commentBuf.String())
-		dataBuf.Reset()
-		commentBuf.Reset()
-
-		if data == "[DONE]" || comment == "[DONE]" {
-			logger.V(logutil.DEFAULT).Info("SSE stream DONE")
-			logger.V(logutil.DEFAULT).Info("SSE raw stream", "raw", rawBuf.String())
-			if gotWID != "" && len(gotTD) == 0 {
-				logger.V(logutil.DEFAULT).Info("SSE DONE: worker_instance_id present, token_data missing")
-			}
-			return true, nil
-		}
-
-		if eventName == "worker_instance_id" {
-			candidate := data
-			if candidate == "" {
-				candidate = comment
-			}
-			if candidate != "" {
-				var s string
-				if json.Unmarshal([]byte(candidate), &s) == nil && s != "" {
-					gotWID = s
-					return false, nil
-				}
-				clean := strings.Trim(candidate, "\"")
-				if clean != "" && clean != "[DONE]" {
-					gotWID = clean
-					return false, nil
-				}
-			}
-		}
-
-		if eventName == "token_data" {
-			candidate := data
-			if candidate == "" {
-				candidate = comment
-			}
-			if candidate != "" {
-				if arr := toInt64SliceJSON(candidate); len(arr) > 0 {
-					gotTD = arr
-					return false, nil
-				}
-			}
-		}
-
-		if data != "" {
-			var msg map[string]any
-			if json.Unmarshal([]byte(data), &msg) == nil {
-				if wid, ok := msg["worker_instance_id"].(string); ok && wid != "" {
-					gotWID = wid
-				}
-				if ann, ok := msg["annotations"].(map[string]any); ok {
-					if wid, ok := ann["worker_instance_id"].(string); ok && wid != "" {
-						gotWID = wid
-					}
-				}
-				if td, ok := msg["token_data"]; ok {
-					if arr := toInt64Slice(td); len(arr) > 0 {
-						gotTD = arr
-					}
-				} else if nv, ok := msg["nvext"].(map[string]any); ok {
-					if td, ok := nv["token_data"]; ok {
-						if arr := toInt64Slice(td); len(arr) > 0 {
-							gotTD = arr
-						}
-					}
-				}
-			}
-		}
-		return false, nil
-	}
-
-	for {
-		line, err := reader.ReadString('\n')
-		rawBuf.WriteString(line)
-		if err != nil {
-			if err == io.EOF {
-				_, _ = flushEvent()
-				logger.V(logutil.DEFAULT).Info("SSE raw stream (EOF)", "raw", rawBuf.String())
-				if gotWID != "" && len(gotTD) == 0 {
-					logger.V(logutil.DEFAULT).Info("EOF: worker_instance_id present, token_data missing")
-				}
-				if gotWID != "" || len(gotTD) > 0 {
-					return gotWID, gotTD, nil
-				}
-				logger.V(logutil.DEFAULT).Error(nil, "EOF before selection fields present")
-				return "", nil, fmt.Errorf("selection not found in SSE stream (EOF)")
-			}
-			logger.V(logutil.DEFAULT).Error(err, "SSE read error")
-			return "", nil, fmt.Errorf("sse read error: %w", err)
-		}
-
-		l := strings.TrimRight(line, "\r\n")
-		if l == "" {
-			if done, _ := flushEvent(); done {
-				if gotWID != "" && len(gotTD) == 0 {
-					logger.V(logutil.DEFAULT).Info("SSE DONE: worker_instance_id present, token_data missing")
-				}
-				return gotWID, gotTD, nil
-			}
-			eventName = ""
-			continue
-		}
-
-		if strings.HasPrefix(l, ":") {
-			commentLine := strings.TrimSpace(l[1:])
-			if commentBuf.Len() > 0 {
-				commentBuf.WriteByte('\n')
-			}
-			commentBuf.WriteString(commentLine)
-			continue
-		}
-
-		if idx := strings.IndexByte(l, ':'); idx != -1 {
-			field := l[:idx]
-			val := strings.TrimSpace(l[idx+1:])
-			switch field {
-			case "event":
-				eventName = val
-			case "data":
-				if dataBuf.Len() > 0 {
-					dataBuf.WriteByte('\n')
-				}
-				dataBuf.WriteString(val)
-			default:
-			}
-		}
-	}
-}
-
-func encodeTokenData(tokens []int64) string {
-	b, _ := json.Marshal(tokens)
-	return base64.StdEncoding.EncodeToString(b)
-}
-
-func toInt64Slice(v any) []int64 {
-	xs, ok := v.([]any)
-	if !ok {
-		return nil
-	}
-	out := make([]int64, 0, len(xs))
-	for _, it := range xs {
-		switch n := it.(type) {
-		case float64:
-			out = append(out, int64(n))
-		case int64:
-			out = append(out, n)
-		case json.Number:
-			if i, err := n.Int64(); err == nil {
-				out = append(out, i)
-			}
-		}
-	}
-	return out
-}
-
-func toInt64SliceJSON(s string) []int64 {
-	var arr []int64
-	if err := json.Unmarshal([]byte(s), &arr); err == nil && len(arr) > 0 {
-		return arr
-	}
-	var inner string
-	if err := json.Unmarshal([]byte(s), &inner); err == nil && inner != "" {
-		var arr2 []int64
-		if err := json.Unmarshal([]byte(inner), &arr2); err == nil && len(arr2) > 0 {
-			return arr2
-		}
-	}
-	unquoted := strings.Trim(s, "\"")
-	if unquoted != s {
-		var arr3 []int64
-		if err := json.Unmarshal([]byte(unquoted), &arr3); err == nil && len(arr3) > 0 {
-			return arr3
-		}
-	}
-	return nil
-}
 
 // --------------------------- FFI integration ---------------------------
 
@@ -523,14 +236,14 @@ func initFFI() error {
 		defer C.free(unsafe.Pointer(cm))
 		defer C.free(unsafe.Pointer(model))
 
-		// 1) runtime
+		// Init Dynamo runtime
 		if rc := C.dynamo_llm_init(ns, cm, C.int64_t(ffiWorkerID), C.uint32_t(ffiKvBlockSize)); rc != C.DYNAMO_OK {
 			ffiErr = fmt.Errorf("dynamo_llm_init failed")
 			return
 		}
 		runtimeInitialized = true
 
-		// 2) create persistent pipeline
+		// Create persistent pipeline
 		pipelineMutex.Lock()
 		defer pipelineMutex.Unlock()
 
@@ -555,6 +268,11 @@ func initFFI() error {
 }
 
 // --------------------------- scoring ---------------------------
+
+func encodeTokenData(tokens []int64) string {
+	b, _ := json.Marshal(tokens)
+	return base64.StdEncoding.EncodeToString(b)
+}
 
 func (k *KVAwareScorer) Score(
 	ctx context.Context,
