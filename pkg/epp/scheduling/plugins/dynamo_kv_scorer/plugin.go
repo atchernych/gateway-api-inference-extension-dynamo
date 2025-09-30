@@ -251,10 +251,10 @@ func initFFI() error {
 			ns,
 			cm,
 			model,
-			C.bool(true),                    // use_kv_routing
-			C.double(-1.0),                  // busy_threshold (default)
-			C.double(ffiOverlapScoreWeight), // overlap_score_weight (neg = default)
-			C.double(ffiRouterTemperature),  // router_temperature (neg = default)
+			C.bool(getEnvBoolOrDefault("DYNAMO_USE_KV_ROUTING", true)),
+			C.double(getEnvFloatOrDefault("DYNAMO_BUSY_THRESHOLD", -1.0)),
+			C.double(ffiOverlapScoreWeight),
+			C.double(ffiRouterTemperature),
 			C.bool(getEnvBoolOrDefault("DYNAMO_USE_KV_EVENTS", true)),
 			C.bool(getEnvBoolOrDefault("DYNAMO_ROUTER_REPLICA_SYNC", false)),
 			&pipeline,
