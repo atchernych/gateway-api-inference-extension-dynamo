@@ -256,7 +256,7 @@ func initFFI() error {
 			C.double(ffiOverlapScoreWeight),
 			C.double(ffiRouterTemperature),
 			C.bool(getEnvBoolOrDefault("DYNAMO_USE_KV_EVENTS", true)),
-			C.bool(getEnvBoolOrDefault("DYNAMO_ROUTER_REPLICA_SYNC", false)),
+			C.bool(getEnvBoolOrDefault("DYNAMO_ROUTER_REPLICA_SYNC", true)),
 			&pipeline,
 		)
 		if rc != C.DYNAMO_OK {
