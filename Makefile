@@ -192,7 +192,7 @@ dynamo-image-local-load: dynamo-image-local-build
 dynamo-image-build: ## Build the Dynamo EPP image using Docker Buildx with CGO support.
 	$(IMAGE_BUILD_CMD) -f Dockerfile.dynamo -t $(IMAGE_TAG) \
 		--platform=$(PLATFORMS) \
-		--build-arg BASE_IMAGE=ubuntu:22.04 \
+		--build-arg BASE_IMAGE=ubuntu:24.04 \
 		--build-arg BUILDER_IMAGE=$(BUILDER_IMAGE) \
 		--build-arg COMMIT_SHA=${GIT_COMMIT_SHA} \
 		--build-arg BUILD_REF=${BUILD_REF} \
