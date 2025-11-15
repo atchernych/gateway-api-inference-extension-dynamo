@@ -193,100 +193,41 @@ func (d *Director) admitRequest(ctx context.Context, requestCriticality v1alpha2
 func (d *Director) getCandidatePodsForScheduling(ctx context.Context, requestMetadata map[string]any) []schedulingtypes.Pod {
 	loggerTrace := log.FromContext(ctx).V(logutil.TRACE)
 
-	// DEBUG: Print all pods in datastore at the start
-	allPodsInDatastore := d.datastore.PodGetAll()
-	fmt.Printf("\n========== DEBUG: getCandidatePodsForScheduling START ==========\n")
-	fmt.Printf("Total pods in datastore: %d\n", len(allPodsInDatastore))
-	for i, podMetrics := range allPodsInDatastore {
-		pod := podMetrics.GetPod()
-		metrics := podMetrics.GetMetrics()
-		fmt.Printf("Pod #%d:\n", i+1)
-		fmt.Printf("  Name: %s\n", pod.NamespacedName.Name)
-		fmt.Printf("  Namespace: %s\n", pod.NamespacedName.Namespace)
-		fmt.Printf("  Address (IP): %s\n", pod.Address)
-		fmt.Printf("  Metrics:\n")
-		fmt.Printf("    WaitingQueueSize: %d\n", metrics.WaitingQueueSize)
-		fmt.Printf("    RunningQueueSize: %d\n", metrics.RunningQueueSize)
-		fmt.Printf("    KVCacheUsagePercent: %.2f%%\n", metrics.KVCacheUsagePercent*100)
-		fmt.Printf("    KvCacheMaxTokenCapacity: %d\n", metrics.KvCacheMaxTokenCapacity)
-		fmt.Printf("    ActiveModels: %v\n", metrics.ActiveModels)
-		fmt.Printf("    WaitingModels: %v\n", metrics.WaitingModels)
-		fmt.Printf("    MaxActiveModels: %d\n", metrics.MaxActiveModels)
-		fmt.Printf("    UpdateTime: %v\n", metrics.UpdateTime)
-	}
-	fmt.Printf("========== END: All Pods in Datastore ==========\n\n")
-
 	subsetMap, found := requestMetadata[subsetHintNamespace].(map[string]any)
-	fmt.Printf("DEBUG: Checking for subset metadata in namespace '%s'\n", subsetHintNamespace)
-	fmt.Printf("DEBUG: Subset metadata found: %v\n", found)
-
 	if !found {
-		fmt.Printf("DEBUG: No subset metadata found, returning ALL pods from datastore\n")
-		fmt.Printf("DEBUG: About to return %d pods (all pods)\n", len(allPodsInDatastore))
-		result := d.toSchedulerPodMetrics(allPodsInDatastore)
-		fmt.Printf("DEBUG: Converted to scheduler pod metrics, returning %d pods\n", len(result))
-		fmt.Printf("========== DEBUG: getCandidatePodsForScheduling END (no subset) ==========\n\n")
-		return result
+		return d.toSchedulerPodMetrics(d.datastore.PodGetAll())
 	}
 
 	// Check if endpoint key is present in the subset map and ensure there is at least one value
 	endpointSubsetList, found := subsetMap[subsetHintKey].([]any)
-	fmt.Printf("DEBUG: Checking for endpoint subset key '%s' in subset map\n", subsetHintKey)
-	fmt.Printf("DEBUG: Endpoint subset key found: %v\n", found)
-
 	if !found {
-		fmt.Printf("DEBUG: Endpoint subset key not found, returning ALL pods from datastore\n")
-		fmt.Printf("DEBUG: About to return %d pods (all pods)\n", len(allPodsInDatastore))
-		result := d.toSchedulerPodMetrics(allPodsInDatastore)
-		fmt.Printf("DEBUG: Converted to scheduler pod metrics, returning %d pods\n", len(result))
-		fmt.Printf("========== DEBUG: getCandidatePodsForScheduling END (no subset key) ==========\n\n")
-		return result
+		return d.toSchedulerPodMetrics(d.datastore.PodGetAll())
 	} else if len(endpointSubsetList) == 0 {
 		loggerTrace.Info("found empty subset filter in request metadata, filtering all pods")
-		fmt.Printf("DEBUG: Empty endpoint subset list, returning 0 pods\n")
-		fmt.Printf("========== DEBUG: getCandidatePodsForScheduling END (empty subset) ==========\n\n")
 		return []schedulingtypes.Pod{}
 	}
 
 	// Create a map of endpoint addresses for easy lookup
 	endpoints := make(map[string]bool)
-	fmt.Printf("DEBUG: Endpoint subset list contains %d entries:\n", len(endpointSubsetList))
-	for i, endpoint := range endpointSubsetList {
+	for _, endpoint := range endpointSubsetList {
 		// Extract address from endpoint
 		// The endpoint is formatted as "<address>:<port>" (ex. "10.0.1.0:8080")
 		epStr := strings.Split(endpoint.(string), ":")[0]
 		endpoints[epStr] = true
-		fmt.Printf("  Endpoint #%d: %s -> IP filter: %s\n", i+1, endpoint, epStr)
 	}
 
 	podTotalCount := 0
-	fmt.Printf("DEBUG: Starting pod filtering against %d endpoint IPs\n", len(endpoints))
 	podFitleredList := d.datastore.PodList(func(pm backendmetrics.PodMetrics) bool {
 		podTotalCount++
-		podIP := pm.GetPod().Address
-		matched := false
-		if _, found := endpoints[podIP]; found {
-			matched = true
+		if _, found := endpoints[pm.GetPod().Address]; found {
+			return true
 		}
-		fmt.Printf("  Checking pod #%d (Name: %s, IP: %s) -> Match: %v\n",
-			podTotalCount, pm.GetPod().NamespacedName.Name, podIP, matched)
-		return matched
+		return false
 	})
 
-	fmt.Printf("DEBUG: Filtering complete. Checked %d pods, %d matched\n", podTotalCount, len(podFitleredList))
 	loggerTrace.Info("filtered candidate pods by subset filtering", "podTotalCount", podTotalCount, "filteredCount", len(podFitleredList))
 
-	fmt.Printf("DEBUG: Filtered pods details:\n")
-	for i, podMetrics := range podFitleredList {
-		pod := podMetrics.GetPod()
-		fmt.Printf("  Filtered Pod #%d: Name=%s, IP=%s\n", i+1, pod.NamespacedName.Name, pod.Address)
-	}
-
-	result := d.toSchedulerPodMetrics(podFitleredList)
-	fmt.Printf("DEBUG: Converted to scheduler pod metrics, returning %d pods\n", len(result))
-	fmt.Printf("========== DEBUG: getCandidatePodsForScheduling END (filtered) ==========\n\n")
-
-	return result
+	return d.toSchedulerPodMetrics(podFitleredList)
 }
 
 // prepareRequest populates the RequestContext and calls the registered PreRequest plugins
