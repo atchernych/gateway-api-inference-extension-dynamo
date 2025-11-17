@@ -18,8 +18,10 @@ package handlers
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	basepb "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	eppb "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
@@ -31,10 +33,48 @@ import (
 
 const modelHeader = "X-Gateway-Model-Name"
 
+// Dynamo-related
+const (
+	workerIDHeader   = "x-worker-instance-id"
+	injectHintHeader = "x-epp-inject-nvext-worker-instance-id"
+	tokenDataHeader  = "x-epp-inject-nvext-token-data"
+)
+
 // HandleRequestBody handles request bodies.
 func (s *Server) HandleRequestBody(ctx context.Context, data map[string]any) ([]*eppb.ProcessingResponse, error) {
 	logger := log.FromContext(ctx)
 	var ret []*eppb.ProcessingResponse
+
+	// If we captured a worker id hint in the headers phase, inject it into body JSON:
+	// nvext.backend_instance_id = <workerID>
+	if wid := strings.TrimSpace(s.workerIDHint); wid != "" {
+		// ensure nvext is a map[string]any
+		if nv, ok := data["nvext"]; !ok || nv == nil {
+			data["nvext"] = map[string]any{"backend_instance_id": wid}
+		} else if m, ok := nv.(map[string]any); ok {
+			m["backend_instance_id"] = wid
+		} else {
+			// if nvext was some other type, replace with a clean map
+			data["nvext"] = map[string]any{"backend_instance_id": wid}
+		}
+	}
+
+	// If we captured token_data in headers, decode and inject as nvext.token_data
+	if td := strings.TrimSpace(s.tokenDataHint); td != "" {
+		// header value is base64(JSON array)
+		if raw, err := base64.StdEncoding.DecodeString(td); err == nil {
+			var arr []int64
+			if err := json.Unmarshal(raw, &arr); err == nil && len(arr) > 0 {
+				// ensure nvext map exists
+				nv, ok := data["nvext"].(map[string]any)
+				if !ok || nv == nil {
+					nv = map[string]any{}
+					data["nvext"] = nv
+				}
+				nv["token_data"] = arr
+			}
+		}
+	}
 
 	requestBodyBytes, err := json.Marshal(data)
 	if err != nil {
@@ -46,6 +86,7 @@ func (s *Server) HandleRequestBody(ctx context.Context, data map[string]any) ([]
 		metrics.RecordModelNotInBodyCounter()
 		logger.V(logutil.DEFAULT).Info("Request body does not contain model parameter")
 		if s.streaming {
+			// still stream the possibly mutated body
 			ret = append(ret, &eppb.ProcessingResponse{
 				Response: &eppb.ProcessingResponse_RequestHeaders{
 					RequestHeaders: &eppb.HeadersResponse{},
@@ -53,14 +94,24 @@ func (s *Server) HandleRequestBody(ctx context.Context, data map[string]any) ([]
 			})
 			ret = addStreamedBodyResponse(ret, requestBodyBytes)
 			return ret, nil
-		} else {
-			ret = append(ret, &eppb.ProcessingResponse{
-				Response: &eppb.ProcessingResponse_RequestBody{
-					RequestBody: &eppb.BodyResponse{},
-				},
-			})
 		}
-		return ret, nil
+
+		// non-streaming: return a body response with the (possibly) mutated body
+		return []*eppb.ProcessingResponse{
+			{
+				Response: &eppb.ProcessingResponse_RequestBody{
+					RequestBody: &eppb.BodyResponse{
+						Response: &eppb.CommonResponse{
+							BodyMutation: &eppb.BodyMutation{
+								Mutation: &eppb.BodyMutation_Body{
+									Body: requestBodyBytes,
+								},
+							},
+						},
+					},
+				},
+			},
+		}, nil
 	}
 
 	modelStr, ok := modelVal.(string)
@@ -73,6 +124,7 @@ func (s *Server) HandleRequestBody(ctx context.Context, data map[string]any) ([]
 	metrics.RecordSuccessCounter()
 
 	if s.streaming {
+		// set the model header, then stream the (possibly) mutated body
 		ret = append(ret, &eppb.ProcessingResponse{
 			Response: &eppb.ProcessingResponse_RequestHeaders{
 				RequestHeaders: &eppb.HeadersResponse{
@@ -86,16 +138,42 @@ func (s *Server) HandleRequestBody(ctx context.Context, data map[string]any) ([]
 										RawValue: []byte(modelStr),
 									},
 								},
+								// also keep the worker id header if we have one
+								func() *basepb.HeaderValueOption {
+									if strings.TrimSpace(s.workerIDHint) == "" {
+										return nil
+									}
+									return &basepb.HeaderValueOption{
+										Header: &basepb.HeaderValue{
+											Key:      workerIDHeader,
+											RawValue: []byte(s.workerIDHint),
+										},
+									}
+								}(),
 							},
 						},
 					},
 				},
 			},
 		})
+
+		// prune nil entries if worker id not present
+		hm := ret[len(ret)-1].GetRequestHeaders().GetResponse().GetHeaderMutation()
+		if hm != nil && hm.SetHeaders != nil {
+			out := hm.SetHeaders[:0]
+			for _, h := range hm.SetHeaders {
+				if h != nil {
+					out = append(out, h)
+				}
+			}
+			hm.SetHeaders = out
+		}
+
 		ret = addStreamedBodyResponse(ret, requestBodyBytes)
 		return ret, nil
 	}
 
+	// Non-streaming: set model header and replace the body with our mutated JSON
 	return []*eppb.ProcessingResponse{
 		{
 			Response: &eppb.ProcessingResponse_RequestBody{
@@ -111,6 +189,22 @@ func (s *Server) HandleRequestBody(ctx context.Context, data map[string]any) ([]
 										RawValue: []byte(modelStr),
 									},
 								},
+								func() *basepb.HeaderValueOption {
+									if strings.TrimSpace(s.workerIDHint) == "" {
+										return nil
+									}
+									return &basepb.HeaderValueOption{
+										Header: &basepb.HeaderValue{
+											Key:      workerIDHeader,
+											RawValue: []byte(s.workerIDHint),
+										},
+									}
+								}(),
+							},
+						},
+						BodyMutation: &eppb.BodyMutation{
+							Mutation: &eppb.BodyMutation_Body{
+								Body: requestBodyBytes,
 							},
 						},
 					},
@@ -141,6 +235,32 @@ func addStreamedBodyResponse(responses []*eppb.ProcessingResponse, requestBodyBy
 
 // HandleRequestHeaders handles request headers.
 func (s *Server) HandleRequestHeaders(headers *eppb.HttpHeaders) ([]*eppb.ProcessingResponse, error) {
+	// reset per-request
+	s.workerIDHint = ""
+	s.tokenDataHint = ""
+
+	if m := headers.GetHeaders(); m != nil {
+		for _, h := range m.GetHeaders() {
+			k := strings.ToLower(h.GetKey())
+
+			switch k {
+			case injectHintHeader, workerIDHeader:
+				if rv := h.GetRawValue(); len(rv) > 0 {
+					s.workerIDHint = strings.TrimSpace(string(rv))
+				} else {
+					s.workerIDHint = strings.TrimSpace(h.GetValue())
+				}
+			case tokenDataHeader:
+				if rv := h.GetRawValue(); len(rv) > 0 {
+					s.tokenDataHint = strings.TrimSpace(string(rv))
+				} else {
+					s.tokenDataHint = strings.TrimSpace(h.GetValue())
+				}
+			}
+		}
+	}
+
+	// No header mutations needed here; body phase will do the JSON injection.
 	return []*eppb.ProcessingResponse{
 		{
 			Response: &eppb.ProcessingResponse_RequestHeaders{
