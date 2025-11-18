@@ -253,7 +253,7 @@ func (d *Director) prepareRequest(ctx context.Context, reqCtx *handlers.RequestC
 	reqCtx.TargetPod = targetPod
 	reqCtx.TargetEndpoint = endpoint
 
-	d.runPreRequestPlugins(ctx, reqCtx.SchedulingRequest, result, targetPort)
+	d.runPreRequestPlugins(ctx, reqCtx.SchedulingRequest, result, targetPort, reqCtx.Request.Body)
 
 	return reqCtx, nil
 }
@@ -319,13 +319,20 @@ func RandomWeightedDraw(logger logr.Logger, model *v1alpha2.InferenceModel, seed
 	return ""
 }
 
-func (d *Director) runPreRequestPlugins(ctx context.Context, request *schedulingtypes.LLMRequest, schedulingResult *schedulingtypes.SchedulingResult,
+func (d *Director) runPreRequestPlugins(
+	ctx context.Context,
+	request *schedulingtypes.LLMRequest,
+	schedulingResult *schedulingtypes.SchedulingResult,
 	targetPort int,
+	body map[string]any,
 ) {
 	for _, plugin := range d.preRequestPlugins {
 		log.FromContext(ctx).V(logutil.DEBUG).Info("Running pre-request plugin", "plugin", plugin.TypedName().Type)
 		before := time.Now()
 		plugin.PreRequest(ctx, request, schedulingResult, targetPort)
+		if mutator, ok := plugin.(RequestBodyMutator); ok && body != nil {
+			mutator.MutateRequestBody(ctx, request, schedulingResult, targetPort, body)
+		}
 		metrics.RecordRequestControlPluginProcessingLatency(PreRequestPluginType, plugin.TypedName().Type, time.Since(before))
 	}
 }
