@@ -96,7 +96,6 @@ func (s *Server) HandleRequestBody(ctx context.Context, data map[string]any) ([]
 		return ret, nil
 	}
 
-	// Non-streaming: set model header only; body passthrough handled by Envoy
 	return []*eppb.ProcessingResponse{
 		{
 			Response: &eppb.ProcessingResponse_RequestBody{
