@@ -46,7 +46,6 @@ func (s *Server) HandleRequestBody(ctx context.Context, data map[string]any) ([]
 		metrics.RecordModelNotInBodyCounter()
 		logger.V(logutil.DEFAULT).Info("Request body does not contain model parameter")
 		if s.streaming {
-			// still stream the possibly mutated body
 			ret = append(ret, &eppb.ProcessingResponse{
 				Response: &eppb.ProcessingResponse_RequestHeaders{
 					RequestHeaders: &eppb.HeadersResponse{},
@@ -56,7 +55,6 @@ func (s *Server) HandleRequestBody(ctx context.Context, data map[string]any) ([]
 			return ret, nil
 		}
 
-		// non-streaming: return a body response without mutation
 		return []*eppb.ProcessingResponse{
 			{
 				Response: &eppb.ProcessingResponse_RequestBody{
@@ -76,7 +74,6 @@ func (s *Server) HandleRequestBody(ctx context.Context, data map[string]any) ([]
 	metrics.RecordSuccessCounter()
 
 	if s.streaming {
-		// set the model header, then stream the (possibly) mutated body
 		ret = append(ret, &eppb.ProcessingResponse{
 			Response: &eppb.ProcessingResponse_RequestHeaders{
 				RequestHeaders: &eppb.HeadersResponse{
@@ -96,7 +93,6 @@ func (s *Server) HandleRequestBody(ctx context.Context, data map[string]any) ([]
 				},
 			},
 		})
-
 		ret = addStreamedBodyResponse(ret, requestBodyBytes)
 		return ret, nil
 	}
@@ -147,7 +143,6 @@ func addStreamedBodyResponse(responses []*eppb.ProcessingResponse, requestBodyBy
 
 // HandleRequestHeaders handles request headers.
 func (s *Server) HandleRequestHeaders(headers *eppb.HttpHeaders) ([]*eppb.ProcessingResponse, error) {
-	// No header mutations needed here; body phase will do the JSON injection.
 	return []*eppb.ProcessingResponse{
 		{
 			Response: &eppb.ProcessingResponse_RequestHeaders{
