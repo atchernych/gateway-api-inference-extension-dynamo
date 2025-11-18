@@ -33,10 +33,12 @@ type LLMRequest struct {
 	Prompt string
 	// Headers is a map of the request headers.
 	Headers map[string]string
+	// Annotations provides plugin-specific data that should travel alongside the request.
+	Annotations map[string]any
 }
 
 func (r *LLMRequest) String() string {
-	return fmt.Sprintf("RequestID: %s, TargetModel: %s, PromptLength: %d, Headers: %v", r.RequestId, r.TargetModel, len(r.Prompt), r.Headers)
+	return fmt.Sprintf("RequestID: %s, TargetModel: %s, PromptLength: %d, Headers: %v, Annotations: %v", r.RequestId, r.TargetModel, len(r.Prompt), r.Headers, r.Annotations)
 }
 
 type Pod interface {

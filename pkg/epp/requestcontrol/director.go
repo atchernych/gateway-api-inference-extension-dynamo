@@ -130,6 +130,7 @@ func (d *Director) HandleRequest(ctx context.Context, reqCtx *handlers.RequestCo
 		TargetModel: reqCtx.ResolvedTargetModel,
 		Prompt:      prompt,
 		Headers:     reqCtx.Request.Headers,
+		Annotations: map[string]any{},
 	}
 
 	logger = logger.WithValues("model", reqCtx.Model, "resolvedTargetModel", reqCtx.ResolvedTargetModel, "criticality", requestCriticality)

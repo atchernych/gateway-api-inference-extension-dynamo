@@ -67,7 +67,6 @@ import "C"
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -87,7 +86,7 @@ const (
 	KVAwareScorerType        = "kv-aware-scorer"
 	StateKeyWorkerInstanceID = schedtypes.StateKey("dynamo/worker-instance-id")
 	WorkerIDHeader           = "x-worker-instance-id"
-	TokenDataHeader          = "x-epp-inject-nvext-token-data"
+	tokenDataAnnotationKey   = "dynamo/token-data"
 )
 
 // --------------------------- config / env ---------------------------
@@ -269,11 +268,6 @@ func initFFI() error {
 
 // --------------------------- scoring ---------------------------
 
-func encodeTokenData(tokens []int64) string {
-	b, _ := json.Marshal(tokens)
-	return base64.StdEncoding.EncodeToString(b)
-}
-
 func (k *KVAwareScorer) Score(
 	ctx context.Context,
 	cycle *schedtypes.CycleState,
@@ -298,10 +292,12 @@ func (k *KVAwareScorer) Score(
 		}
 		req.Headers[WorkerIDHeader] = workerID
 		if len(tokenData) > 0 {
-			if req.Headers == nil {
-				req.Headers = map[string]string{}
+			if req.Annotations == nil {
+				req.Annotations = map[string]any{}
 			}
-			req.Headers[TokenDataHeader] = encodeTokenData(tokenData)
+			copied := make([]int64, len(tokenData))
+			copy(copied, tokenData)
+			req.Annotations[tokenDataAnnotationKey] = copied
 		}
 	}
 

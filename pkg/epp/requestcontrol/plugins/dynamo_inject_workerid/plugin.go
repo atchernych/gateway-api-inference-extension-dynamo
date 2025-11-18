@@ -2,7 +2,6 @@ package dynamo_inject_workerid
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"strings"
 
@@ -12,10 +11,10 @@ import (
 )
 
 const (
-	typeString      = "dynamo-inject-workerid"
-	pluginName      = "dynamo-inject-workerid"
-	WorkerIDHeader  = "x-worker-instance-id"
-	TokenDataHeader = "x-epp-inject-nvext-token-data"
+	typeString             = "dynamo-inject-workerid"
+	pluginName             = "dynamo-inject-workerid"
+	WorkerIDHeader         = "x-worker-instance-id"
+	tokenDataAnnotationKey = "dynamo/token-data"
 )
 
 var _ plugins.Plugin = (*InjectWorkerIDPreRequest)(nil)
@@ -88,13 +87,30 @@ func (p *InjectWorkerIDPreRequest) MutateRequestBody(
 	}
 	nvext["backend_instance_id"] = wid
 
-	if td := strings.TrimSpace(req.Headers[TokenDataHeader]); td != "" {
-		if raw, err := base64.StdEncoding.DecodeString(td); err == nil {
-			var tokens []int64
-			if err := json.Unmarshal(raw, &tokens); err == nil && len(tokens) > 0 {
-				nvext["token_data"] = tokens
+	if tokens, ok := req.Annotations[tokenDataAnnotationKey]; ok {
+		switch v := tokens.(type) {
+		case []int64:
+			if len(v) > 0 {
+				nvext["token_data"] = v
+			}
+		case []any:
+			var out []int64
+			for _, elem := range v {
+				switch t := elem.(type) {
+				case int64:
+					out = append(out, t)
+				case float64:
+					out = append(out, int64(t))
+				}
+			}
+			if len(out) > 0 {
+				nvext["token_data"] = out
+			}
+		case json.RawMessage:
+			var out []int64
+			if err := json.Unmarshal(v, &out); err == nil && len(out) > 0 {
+				nvext["token_data"] = out
 			}
 		}
-		delete(req.Headers, TokenDataHeader)
 	}
 }
