@@ -53,15 +53,14 @@ func (s *Server) HandleRequestBody(ctx context.Context, data map[string]any) ([]
 			})
 			ret = addStreamedBodyResponse(ret, requestBodyBytes)
 			return ret, nil
-		}
-
-		return []*eppb.ProcessingResponse{
-			{
+		} else {
+			ret = append(ret, &eppb.ProcessingResponse{
 				Response: &eppb.ProcessingResponse_RequestBody{
 					RequestBody: &eppb.BodyResponse{},
 				},
-			},
-		}, nil
+			})
+		}
+		return ret, nil
 	}
 
 	modelStr, ok := modelVal.(string)
