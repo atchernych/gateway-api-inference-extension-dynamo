@@ -170,6 +170,48 @@ verify-all:
 
 ##@ Build
 
+##@ Dynamo EPP with FFI
+
+# Build the Dynamo EPP image with CGO static library support
+.PHONY: dynamo-image-local-build
+dynamo-image-local-build: ## Build the Dynamo EPP image using Docker Buildx for local development.
+	BUILDER=$(shell $(DOCKER_BUILDX_CMD) create --use)
+	$(MAKE) dynamo-image-build PUSH=$(PUSH)
+	$(MAKE) dynamo-image-build LOAD=$(LOAD)
+	$(DOCKER_BUILDX_CMD) rm $$BUILDER
+
+.PHONY: dynamo-image-local-push
+dynamo-image-local-push: PUSH=--push ## Build the Dynamo EPP image for local development and push it to $IMAGE_REPO.
+dynamo-image-local-push: dynamo-image-local-build
+
+.PHONY: dynamo-image-local-load
+dynamo-image-local-load: LOAD=--load ## Build the Dynamo EPP image for local development and load it in the local Docker registry.
+dynamo-image-local-load: dynamo-image-local-build
+
+.PHONY: dynamo-image-build
+dynamo-image-build: ## Build the Dynamo EPP image using Docker Buildx with CGO support.
+	$(IMAGE_BUILD_CMD) -f Dockerfile.dynamo -t $(IMAGE_TAG) \
+		--platform=$(PLATFORMS) \
+		--build-arg BASE_IMAGE=ubuntu:24.04 \
+		--build-arg BUILDER_IMAGE=$(BUILDER_IMAGE) \
+		--build-arg COMMIT_SHA=${GIT_COMMIT_SHA} \
+		--build-arg BUILD_REF=${BUILD_REF} \
+		$(PUSH) \
+		$(LOAD) \
+		$(IMAGE_BUILD_EXTRA_OPTS) ./
+
+.PHONY: dynamo-image-push
+dynamo-image-push: PUSH=--push ## Build the Dynamo EPP image and push it to $IMAGE_REPO.
+dynamo-image-push: dynamo-image-build
+
+.PHONY: dynamo-image-load
+dynamo-image-load: LOAD=--load ## Build the Dynamo EPP image and load it in the local Docker registry.
+dynamo-image-load: dynamo-image-build
+
+.PHONY: dynamo-image-kind
+dynamo-image-kind: dynamo-image-build ## Build the Dynamo EPP image and load it to kind cluster $KIND_CLUSTER ("kind" by default).
+	kind load docker-image $(IMAGE_TAG) --name $(KIND_CLUSTER)
+
 # Build the container image
 .PHONY: image-local-build
 image-local-build: ## Build the EPP image using Docker Buildx for local development.
