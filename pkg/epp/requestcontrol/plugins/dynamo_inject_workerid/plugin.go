@@ -3,6 +3,7 @@ package dynamo_inject_workerid
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"strings"
 
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/plugins"
@@ -85,7 +86,9 @@ func (p *InjectWorkerIDPreRequest) MutateRequestBody(
 		nvext = map[string]any{}
 		body["nvext"] = nvext
 	}
-	nvext["backend_instance_id"] = wid
+	if widUint, err := strconv.ParseUint(wid, 10, 64); err == nil {
+		nvext["backend_instance_id"] = widUint
+	}
 
 	if tokens, ok := req.Annotations[tokenDataAnnotationKey]; ok {
 		switch v := tokens.(type) {
