@@ -55,6 +55,7 @@ dynamo_llm_result_t dynamo_destroy_worker_selection_pipeline(WorkerSelectionPipe
 dynamo_llm_result_t dynamo_query_worker_selection_and_annotate(WorkerSelectionPipeline *pipeline,
                                                                const char *request_json_c_str,
                                                                int64_t *worker_instance_id_out,
+                                                               int64_t *prefill_worker_id_out,
                                                                uint32_t **token_ids_out,
                                                                size_t *token_count_out,
                                                                char **annotated_request_json_out);
@@ -85,7 +86,9 @@ const (
 	PluginName               = "dynamo-kv-scorer"
 	KVAwareScorerType        = "kv-aware-scorer"
 	StateKeyWorkerInstanceID = schedtypes.StateKey("dynamo/worker-instance-id")
+	StateKeyPrefillWorkerID  = schedtypes.StateKey("dynamo/prefill-worker-id")
 	WorkerIDHeader           = "x-worker-instance-id"
+	PrefillWorkerIDHeader    = "x-prefiller-host-port"
 	tokenDataAnnotationKey   = "dynamo/token-data"
 )
 
@@ -276,13 +279,14 @@ func (k *KVAwareScorer) Score(
 ) map[schedtypes.Pod]float64 {
 	logger := log.FromContext(ctx)
 
-	workerID, tokenData, err := k.callDynamoRouter(ctx, req)
+	workerID, prefillWorkerID, tokenData, err := k.callDynamoRouter(ctx, req)
 	if err != nil {
 		logger.V(logutil.DEFAULT).Error(err, "Dynamo call failed; proceeding without worker id")
 	} else if workerID != "" {
 		logger.V(logutil.DEFAULT).Info(
 			"Dynamo router selected worker",
 			"workerID", workerID,
+			"prefillWorkerID", prefillWorkerID,
 			"tokenDataCount", len(tokenData),
 			"tokenData", tokenData,
 		)
@@ -291,6 +295,13 @@ func (k *KVAwareScorer) Score(
 			req.Headers = map[string]string{}
 		}
 		req.Headers[WorkerIDHeader] = workerID
+
+		// Set prefill worker ID if present
+		if prefillWorkerID != "" {
+			cycle.Write(StateKeyPrefillWorkerID, stateString(prefillWorkerID))
+			req.Headers[PrefillWorkerIDHeader] = prefillWorkerID
+		}
+
 		if len(tokenData) > 0 {
 			if req.Annotations == nil {
 				req.Annotations = map[string]any{}
@@ -313,15 +324,15 @@ func (k *KVAwareScorer) Score(
 func (k *KVAwareScorer) callDynamoRouter(
 	ctx context.Context,
 	req *schedtypes.LLMRequest,
-) (string, []int64, error) {
+) (workerID string, prefillWorkerID string, tokenData []int64, err error) {
 	logger := log.FromContext(ctx)
 
 	if err := initFFI(); err != nil {
 		logger.V(logutil.DEFAULT).Error(err, "FFI init failed")
-		return "", nil, err
+		return "", "", nil, err
 	}
 	if !runtimeInitialized {
-		return "", nil, fmt.Errorf("dynamo runtime not initialized")
+		return "", "", nil, fmt.Errorf("dynamo runtime not initialized")
 	}
 
 	pipelineMutex.RLock()
@@ -329,21 +340,22 @@ func (k *KVAwareScorer) callDynamoRouter(
 	pipelineMutex.RUnlock()
 
 	if currentPipeline == nil {
-		return "", nil, fmt.Errorf("dynamo worker selection pipeline not created")
+		return "", "", nil, fmt.Errorf("dynamo worker selection pipeline not created")
 	}
 
 	// Build OpenAI-compatible JSON request
 	requestBody := buildOpenAIRequest(req)
-	requestJSON, err := json.Marshal(requestBody)
-	if err != nil {
-		logger.V(logutil.DEFAULT).Error(err, "Failed to marshal OpenAI request")
-		return "", nil, fmt.Errorf("marshal OpenAI request: %w", err)
+	requestJSON, jsonErr := json.Marshal(requestBody)
+	if jsonErr != nil {
+		logger.V(logutil.DEFAULT).Error(jsonErr, "Failed to marshal OpenAI request")
+		return "", "", nil, fmt.Errorf("marshal OpenAI request: %w", jsonErr)
 	}
 	cRequestJSON := C.CString(string(requestJSON))
 	defer C.free(unsafe.Pointer(cRequestJSON))
 
 	// Output variables
 	var cWorkerID C.int64_t
+	var cPrefillWorkerID C.int64_t
 	var cTokens *C.uint32_t
 	var cTokenCount C.size_t
 	var cAnnotatedJSON *C.char
@@ -353,12 +365,13 @@ func (k *KVAwareScorer) callDynamoRouter(
 		currentPipeline,
 		cRequestJSON,
 		&cWorkerID,
+		&cPrefillWorkerID,
 		&cTokens,
 		&cTokenCount,
 		&cAnnotatedJSON,
 	)
 	if rc != C.DYNAMO_OK {
-		return "", nil, fmt.Errorf("dynamo_query_worker_selection_and_annotate failed")
+		return "", "", nil, fmt.Errorf("dynamo_query_worker_selection_and_annotate failed")
 	}
 
 	// Copy tokens into Go memory and free C memory
@@ -373,11 +386,15 @@ func (k *KVAwareScorer) callDynamoRouter(
 	}
 	C.dynamo_free_worker_selection_result(cTokens, cTokenCount, cAnnotatedJSON)
 
-	workerID := fmt.Sprintf("%d", int64(cWorkerID))
+	workerIDStr := fmt.Sprintf("%d", int64(cWorkerID))
+	prefillWorkerIDStr := ""
+	if int64(cPrefillWorkerID) != 0 {
+		prefillWorkerIDStr = fmt.Sprintf("%d", int64(cPrefillWorkerID))
+	}
 	logger.V(logutil.DEFAULT).Info("Worker selection completed",
-		"workerID", workerID, "tokenCount", count)
+		"workerID", workerIDStr, "prefillWorkerID", prefillWorkerIDStr, "tokenCount", count)
 
-	return workerID, tokens64, nil
+	return workerIDStr, prefillWorkerIDStr, tokens64, nil
 }
 
 func buildOpenAIRequest(req *schedtypes.LLMRequest) map[string]any {

@@ -15,6 +15,7 @@ const (
 	typeString             = "dynamo-inject-workerid"
 	pluginName             = "dynamo-inject-workerid"
 	WorkerIDHeader         = "x-worker-instance-id"
+	PrefillWorkerIDHeader  = "x-prefiller-host-port"
 	tokenDataAnnotationKey = "dynamo/token-data"
 )
 
@@ -55,11 +56,18 @@ func (p *InjectWorkerIDPreRequest) PreRequest(
 	if req.Headers == nil {
 		req.Headers = map[string]string{}
 	}
+
+	// Handle worker instance ID
 	wid := strings.TrimSpace(req.Headers[WorkerIDHeader])
-	if wid == "" {
-		return
+	if wid != "" {
+		req.Headers[WorkerIDHeader] = wid
 	}
-	req.Headers[WorkerIDHeader] = wid
+
+	// Handle prefill worker ID
+	prefillWid := strings.TrimSpace(req.Headers[PrefillWorkerIDHeader])
+	if prefillWid != "" {
+		req.Headers[PrefillWorkerIDHeader] = prefillWid
+	}
 }
 
 func (p *InjectWorkerIDPreRequest) MutateRequestBody(
@@ -81,13 +89,27 @@ func (p *InjectWorkerIDPreRequest) MutateRequestBody(
 		return
 	}
 
+	prefillWid := strings.TrimSpace(req.Headers[PrefillWorkerIDHeader])
+
 	nvext, _ := body["nvext"].(map[string]any)
 	if nvext == nil {
 		nvext = map[string]any{}
 		body["nvext"] = nvext
 	}
-	if widUint, err := strconv.ParseUint(wid, 10, 64); err == nil {
-		nvext["backend_instance_id"] = widUint
+
+	if prefillWid != "" {
+		// Disaggregated mode: use prefill_worker_id and decode_worker_id
+		if prefillWidUint, err := strconv.ParseUint(prefillWid, 10, 64); err == nil {
+			nvext["prefill_worker_id"] = prefillWidUint
+		}
+		if widUint, err := strconv.ParseUint(wid, 10, 64); err == nil {
+			nvext["decode_worker_id"] = widUint
+		}
+	} else {
+		// Non-disaggregated mode: use backend_instance_id
+		if widUint, err := strconv.ParseUint(wid, 10, 64); err == nil {
+			nvext["backend_instance_id"] = widUint
+		}
 	}
 
 	if tokens, ok := req.Annotations[tokenDataAnnotationKey]; ok {
@@ -113,6 +135,36 @@ func (p *InjectWorkerIDPreRequest) MutateRequestBody(
 			var out []int64
 			if err := json.Unmarshal(v, &out); err == nil && len(out) > 0 {
 				nvext["token_data"] = out
+			}
+		}
+	}
+
+	// Remove query_instance_id from nvext.annotations if present
+	if annotations, ok := nvext["annotations"]; ok {
+		switch annList := annotations.(type) {
+		case []string:
+			filtered := make([]string, 0, len(annList))
+			for _, ann := range annList {
+				if ann != "query_instance_id" {
+					filtered = append(filtered, ann)
+				}
+			}
+			if len(filtered) == 0 {
+				delete(nvext, "annotations")
+			} else {
+				nvext["annotations"] = filtered
+			}
+		case []any:
+			filtered := make([]any, 0, len(annList))
+			for _, ann := range annList {
+				if str, ok := ann.(string); !ok || str != "query_instance_id" {
+					filtered = append(filtered, ann)
+				}
+			}
+			if len(filtered) == 0 {
+				delete(nvext, "annotations")
+			} else {
+				nvext["annotations"] = filtered
 			}
 		}
 	}
