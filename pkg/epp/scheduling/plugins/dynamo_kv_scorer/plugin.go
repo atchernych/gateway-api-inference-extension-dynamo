@@ -48,13 +48,14 @@ dynamo_llm_result_t dynamo_create_worker_selection_pipeline(const char *namespac
                                                             double router_temperature,
                                                             bool use_kv_events,
                                                             bool router_replica_sync,
+                                                            bool enforce_disagg,
                                                             WorkerSelectionPipeline **pipeline_out);
 
 dynamo_llm_result_t dynamo_destroy_worker_selection_pipeline(WorkerSelectionPipeline *pipeline);
 
 dynamo_llm_result_t dynamo_query_worker_selection_and_annotate(WorkerSelectionPipeline *pipeline,
                                                                const char *request_json_c_str,
-                                                               int64_t *worker_instance_id_out,
+                                                               int64_t *decode_worker_id_out,
                                                                int64_t *prefill_worker_id_out,
                                                                uint32_t **token_ids_out,
                                                                size_t *token_count_out,
@@ -155,6 +156,7 @@ var (
 	ffiRouterTemperature  float64
 	ffiKvBlockSize        uint32
 	ffiWorkerID           int64
+	ffiEnforceDisagg      bool
 
 	runtimeInitialized bool
 
@@ -168,6 +170,7 @@ func loadDynamoConfig() {
 	ffiComponent = getEnvOrDefault("DYNAMO_COMPONENT", "backend")
 	ffiModel = getEnvOrDefault("DYNAMO_MODEL", "Qwen/Qwen3-0.6B")
 	ffiWorkerID = getEnvInt64OrDefault("DYNAMO_WORKER_ID", 1)
+	ffiEnforceDisagg = getEnvBoolOrDefault("DYNAMO_ENFORCE_DISAGG", true) // TODO default to false
 
 	ffiOverlapScoreWeight = getEnvFloatOrDefault("DYNAMO_OVERLAP_SCORE_WEIGHT", -1.0)
 	ffiRouterTemperature = getEnvFloatOrDefault("DYNAMO_ROUTER_TEMPERATURE", -1.0)
@@ -259,6 +262,7 @@ func initFFI() error {
 			C.double(ffiRouterTemperature),
 			C.bool(getEnvBoolOrDefault("DYNAMO_USE_KV_EVENTS", true)),
 			C.bool(getEnvBoolOrDefault("DYNAMO_ROUTER_REPLICA_SYNC", true)),
+			C.bool(ffiEnforceDisagg),
 			&pipeline,
 		)
 		if rc != C.DYNAMO_OK {
@@ -354,7 +358,7 @@ func (k *KVAwareScorer) callDynamoRouter(
 	defer C.free(unsafe.Pointer(cRequestJSON))
 
 	// Output variables
-	var cWorkerID C.int64_t
+	var cDecodeWorkerID C.int64_t
 	var cPrefillWorkerID C.int64_t
 	var cTokens *C.uint32_t
 	var cTokenCount C.size_t
@@ -364,7 +368,7 @@ func (k *KVAwareScorer) callDynamoRouter(
 	rc := C.dynamo_query_worker_selection_and_annotate(
 		currentPipeline,
 		cRequestJSON,
-		&cWorkerID,
+		&cDecodeWorkerID,
 		&cPrefillWorkerID,
 		&cTokens,
 		&cTokenCount,
@@ -386,9 +390,10 @@ func (k *KVAwareScorer) callDynamoRouter(
 	}
 	C.dynamo_free_worker_selection_result(cTokens, cTokenCount, cAnnotatedJSON)
 
-	workerIDStr := fmt.Sprintf("%d", int64(cWorkerID))
+	workerIDStr := fmt.Sprintf("%d", int64(cDecodeWorkerID))
 	prefillWorkerIDStr := ""
-	if int64(cPrefillWorkerID) != 0 {
+	// Rust returns -1 for prefill_worker_id when not in disaggregated mode
+	if int64(cPrefillWorkerID) >= 0 {
 		prefillWorkerIDStr = fmt.Sprintf("%d", int64(cPrefillWorkerID))
 	}
 	logger.V(logutil.DEFAULT).Info("Worker selection completed",

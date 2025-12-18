@@ -97,7 +97,7 @@ func (p *InjectWorkerIDPreRequest) MutateRequestBody(
 		body["nvext"] = nvext
 	}
 
-	if prefillWid != "" {
+	if prefillWid != "" && prefillWid != wid {
 		// Disaggregated mode: use prefill_worker_id and decode_worker_id
 		if prefillWidUint, err := strconv.ParseUint(prefillWid, 10, 64); err == nil {
 			nvext["prefill_worker_id"] = prefillWidUint
@@ -106,7 +106,7 @@ func (p *InjectWorkerIDPreRequest) MutateRequestBody(
 			nvext["decode_worker_id"] = widUint
 		}
 	} else {
-		// Non-disaggregated mode: use backend_instance_id
+		// Aggregated mode (empty prefill or prefill == decode): use backend_instance_id
 		if widUint, err := strconv.ParseUint(wid, 10, 64); err == nil {
 			nvext["backend_instance_id"] = widUint
 		}
