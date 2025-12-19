@@ -170,7 +170,7 @@ func loadDynamoConfig() {
 	ffiComponent = getEnvOrDefault("DYNAMO_COMPONENT", "backend")
 	ffiModel = getEnvOrDefault("DYNAMO_MODEL", "Qwen/Qwen3-0.6B")
 	ffiWorkerID = getEnvInt64OrDefault("DYNAMO_WORKER_ID", 1)
-	ffiEnforceDisagg = getEnvBoolOrDefault("DYNAMO_ENFORCE_DISAGG", true) // TODO default to false
+	ffiEnforceDisagg = getEnvBoolOrDefault("DYNAMO_ENFORCE_DISAGG", false)
 
 	ffiOverlapScoreWeight = getEnvFloatOrDefault("DYNAMO_OVERLAP_SCORE_WEIGHT", -1.0)
 	ffiRouterTemperature = getEnvFloatOrDefault("DYNAMO_ROUTER_TEMPERATURE", -1.0)
