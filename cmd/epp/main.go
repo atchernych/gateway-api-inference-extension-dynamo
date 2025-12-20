@@ -25,6 +25,7 @@ import (
 	eppplugins "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/plugins"
 
 	// Dynamo plugins
+	dyncleanup "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/requestcontrol/plugins/dynamo_cleanup"
 	dynprereq "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/requestcontrol/plugins/dynamo_inject_workerid"
 	dynscorer "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/scheduling/plugins/dynamo_kv_scorer"
 )
@@ -37,6 +38,7 @@ func main() {
 
 	eppplugins.Register("dynamo-inject-workerid", dynprereq.InjectWorkerIDPreRequestFactory)
 	eppplugins.Register("kv-aware-scorer", dynscorer.KVAwareScorerFactory)
+	eppplugins.Register("dynamo-cleanup", dyncleanup.DynamoCleanupPluginFactory)
 
 	if err := runner.NewRunner().Run(ctrl.SetupSignalHandler()); err != nil {
 		os.Exit(1)

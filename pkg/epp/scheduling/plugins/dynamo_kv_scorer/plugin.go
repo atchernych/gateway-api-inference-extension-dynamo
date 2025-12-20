@@ -64,6 +64,20 @@ dynamo_llm_result_t dynamo_query_worker_selection_and_annotate(WorkerSelectionPi
 dynamo_llm_result_t dynamo_free_worker_selection_result(uint32_t *token_ids,
                                                         size_t token_count,
                                                         char *annotated_request_json);
+
+// Router bookkeeping functions for GAIE integration
+dynamo_llm_result_t dynamo_router_add_request(WorkerSelectionPipeline *pipeline,
+                                              const char *request_id_c_str,
+                                              const uint32_t *token_ids,
+                                              size_t token_count,
+                                              uint64_t worker_id,
+                                              uint32_t dp_rank);
+
+dynamo_llm_result_t dynamo_router_mark_prefill_complete(WorkerSelectionPipeline *pipeline,
+                                                        const char *request_id_c_str);
+
+dynamo_llm_result_t dynamo_router_free_request(WorkerSelectionPipeline *pipeline,
+                                               const char *request_id_c_str);
 */
 import "C"
 
@@ -88,6 +102,7 @@ const (
 	KVAwareScorerType        = "kv-aware-scorer"
 	StateKeyWorkerInstanceID = schedtypes.StateKey("dynamo/worker-instance-id")
 	StateKeyPrefillWorkerID  = schedtypes.StateKey("dynamo/prefill-worker-id")
+	StateKeyRequestID        = schedtypes.StateKey("dynamo/request-id")
 	WorkerIDHeader           = "x-worker-instance-id"
 	PrefillWorkerIDHeader    = "x-prefiller-host-port"
 	tokenDataAnnotationKey   = "dynamo/token-data"
@@ -314,6 +329,19 @@ func (k *KVAwareScorer) Score(
 			copy(copied, tokenData)
 			req.Annotations[tokenDataAnnotationKey] = copied
 		}
+
+		// GAIE Stage 1: Register request with router bookkeeping
+		// The request ID comes from Envoy's request ID header
+		requestID := req.RequestId
+		if requestID != "" {
+			cycle.Write(StateKeyRequestID, stateString(requestID))
+			if addErr := k.callAddRequest(ctx, requestID, tokenData, workerID, prefillWorkerID); addErr != nil {
+				logger.V(logutil.DEFAULT).Error(addErr, "Failed to add request to router bookkeeping",
+					"requestID", requestID)
+			}
+		} else {
+			logger.V(logutil.VERBOSE).Info("No request ID available, skipping router bookkeeping")
+		}
 	}
 
 	out := make(map[schedtypes.Pod]float64, len(pods))
@@ -421,6 +449,119 @@ func buildOpenAIRequest(req *schedtypes.LLMRequest) map[string]any {
 		"annotations": []string{"query_instance_id"},
 	}
 	return requestBody
+}
+
+// --------------------------- router bookkeeping ---------------------------
+
+// callAddRequest registers a request with the router's bookkeeping.
+// This should be called after worker selection to track active requests.
+func (k *KVAwareScorer) callAddRequest(
+	ctx context.Context,
+	requestID string,
+	tokenData []int64,
+	workerID string,
+	prefillWorkerID string,
+) error {
+	logger := log.FromContext(ctx)
+
+	if !runtimeInitialized {
+		return fmt.Errorf("dynamo runtime not initialized")
+	}
+
+	pipelineMutex.RLock()
+	currentPipeline := pipeline
+	pipelineMutex.RUnlock()
+
+	if currentPipeline == nil {
+		return fmt.Errorf("dynamo worker selection pipeline not created")
+	}
+
+	// Parse worker ID (use decode worker for bookkeeping in disagg mode)
+	var workerIDUint uint64
+	if _, err := fmt.Sscanf(workerID, "%d", &workerIDUint); err != nil {
+		return fmt.Errorf("invalid worker ID: %s", workerID)
+	}
+
+	// Convert token data from int64 to uint32
+	tokens := make([]uint32, len(tokenData))
+	for i, t := range tokenData {
+		tokens[i] = uint32(t)
+	}
+
+	cRequestID := C.CString(requestID)
+	defer C.free(unsafe.Pointer(cRequestID))
+
+	var cTokens *C.uint32_t
+	if len(tokens) > 0 {
+		cTokens = (*C.uint32_t)(unsafe.Pointer(&tokens[0]))
+	}
+
+	rc := C.dynamo_router_add_request(
+		currentPipeline,
+		cRequestID,
+		cTokens,
+		C.size_t(len(tokens)),
+		C.uint64_t(workerIDUint),
+		C.uint32_t(0), // dp_rank = 0 for now
+	)
+
+	if rc != C.DYNAMO_OK {
+		return fmt.Errorf("dynamo_router_add_request failed")
+	}
+
+	logger.V(logutil.VERBOSE).Info("Added request to router bookkeeping",
+		"requestID", requestID, "workerID", workerID, "tokenCount", len(tokens))
+	return nil
+}
+
+// CallMarkPrefillComplete marks prefill as completed for a request.
+// Exported for use by response handlers.
+func CallMarkPrefillComplete(requestID string) error {
+	if !runtimeInitialized {
+		return fmt.Errorf("dynamo runtime not initialized")
+	}
+
+	pipelineMutex.RLock()
+	currentPipeline := pipeline
+	pipelineMutex.RUnlock()
+
+	if currentPipeline == nil {
+		return fmt.Errorf("dynamo worker selection pipeline not created")
+	}
+
+	cRequestID := C.CString(requestID)
+	defer C.free(unsafe.Pointer(cRequestID))
+
+	rc := C.dynamo_router_mark_prefill_complete(currentPipeline, cRequestID)
+	if rc != C.DYNAMO_OK {
+		return fmt.Errorf("dynamo_router_mark_prefill_complete failed")
+	}
+	return nil
+}
+
+// CallFreeRequest cleans up router state for a completed/cancelled request.
+// Exported for use by response handlers.
+func CallFreeRequest(requestID string) error {
+	if !runtimeInitialized {
+		return fmt.Errorf("dynamo runtime not initialized")
+	}
+
+	pipelineMutex.RLock()
+	currentPipeline := pipeline
+	pipelineMutex.RUnlock()
+
+	if currentPipeline == nil {
+		return fmt.Errorf("dynamo worker selection pipeline not created")
+	}
+
+	cRequestID := C.CString(requestID)
+	defer C.free(unsafe.Pointer(cRequestID))
+
+	rc := C.dynamo_router_free_request(currentPipeline, cRequestID)
+	if rc != C.DYNAMO_OK {
+		return fmt.Errorf("dynamo_router_free_request failed")
+	}
+	return nil
 }
 
 // --------------------------- shutdown ---------------------------
