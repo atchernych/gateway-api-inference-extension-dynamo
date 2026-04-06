@@ -1,0 +1,74 @@
+// Copyright 2025 The Kubernetes Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package epplight;
+
+option go_package = "sigs.k8s.io/gateway-api-inference-extension/pkg/epp-light/proto/gen";
+
+// EndpointPickerService is the language-agnostic interface for endpoint selection.
+// Implement this service in any language (Rust, Python, C++, etc.) to plug custom
+// selection logic into the Light EPP protocol layer.
+//
+// The Go Light EPP handles all Envoy ext-proc protocol details, InferencePool CRD
+// discovery, and pod lifecycle management. This service only needs to decide which
+// endpoint to route to.
+service EndpointPickerService {
+  // Pick selects one or more endpoints from the available set for a given request.
+  rpc Pick(PickRequest) returns (PickResponse);
+}
+
+// PickRequest contains all information needed to make an endpoint selection decision.
+message PickRequest {
+  // HTTP request headers.
+  map<string, string> headers = 1;
+
+  // Raw HTTP request body bytes. May be empty for header-only requests (e.g., GET).
+  bytes body = 2;
+
+  // Model name extracted from the request body, if present.
+  string model = 3;
+
+  // Candidate endpoint subset from x-gateway-destination-endpoint-subset metadata.
+  // When non-empty, the picker MUST select only from endpoints matching this set.
+  repeated string candidate_subset = 4;
+
+  // Available endpoints in the pool, already filtered by candidate_subset if applicable.
+  repeated EndpointInfo endpoints = 5;
+}
+
+// EndpointInfo describes a backend endpoint available in the InferencePool.
+message EndpointInfo {
+  // Pod IP address.
+  string address = 1;
+
+  // Target port number as a string.
+  string port = 2;
+
+  // Pod name in "namespace/name" format.
+  string name = 3;
+
+  // Pod Kubernetes labels.
+  map<string, string> labels = 4;
+}
+
+// PickResponse is the result of endpoint selection.
+message PickResponse {
+  // Primary selected endpoint in "ip:port" format.
+  string endpoint = 1;
+
+  // Optional fallback endpoints in "ip:port" format, tried in order if primary fails.
+  repeated string fallbacks = 2;
+}

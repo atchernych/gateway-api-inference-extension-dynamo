@@ -129,6 +129,15 @@ generate-proto: protoc-gen-go protoc-gen-go-grpc ## Generate Golang code from pr
 		--go-grpc_out=module=sigs.k8s.io/gateway-api-inference-extension:. \
 		pkg/epp/framework/plugins/requesthandling/parsers/vllmgrpc/api/proto/*.proto
 
+.PHONY: generate-proto-light
+generate-proto-light: protoc-gen-go protoc-gen-go-grpc ## Generate Golang code from light EPP protobuf files.
+	PATH="$(LOCALBIN):$$PATH" $(PROTOC) \
+		-I pkg/epp-light/proto \
+		-I . \
+		--go_out=module=sigs.k8s.io/gateway-api-inference-extension:. \
+		--go-grpc_out=module=sigs.k8s.io/gateway-api-inference-extension:. \
+		pkg/epp-light/proto/*.proto
+
 # Use same code-generator version as k8s.io/api
 CODEGEN_VERSION := $(shell go list -m -f '{{.Version}}' k8s.io/api)
 CODEGEN = $(shell pwd)/bin/code-generator
