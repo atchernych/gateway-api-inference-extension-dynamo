@@ -253,13 +253,14 @@ Envoy ──ext-proc──► Go Light EPP ──gRPC──► Rust/Python Picke
 ```
 
 The non-Go code only implements endpoint selection. The Go Light EPP handles:
-- The ext-proc bidirectional streaming state machine (7 request states, correct response ordering, chunking)
-- EPP protocol metadata (`envoy.lb` namespace, `x-gateway-destination-endpoint` in headers and dynamic metadata)
-- Subset filtering from `envoy.lb.subset_hint`
-- InferencePool CRD watching (Kubernetes controller-runtime, pod reconciliation, label selectors, readiness tracking)
+- The ext-proc bidirectional streaming state machine with 7 request states, correct response ordering, and chunking (`server.go` — 273 lines)
+- EPP protocol metadata generation: `envoy.lb` namespace, `x-gateway-destination-endpoint` in both headers and dynamic metadata, subset filtering from `envoy.lb.subset_hint` (`request.go` — 163 lines, `response.go` — 43 lines)
+- InferencePool CRD watching via Kubernetes controller-runtime: pod reconciliation, label selectors, readiness tracking, active ports (`datastore.go` — 230 lines, `controller/` — 166 lines)
 - Error responses (`ImmediateResponse` with 503/429 per the protocol spec)
 
-This is ~500 lines of protocol-specific code that has nothing to do with choosing an endpoint. The gRPC picker service lets implementors skip all of it.
+This is ~900 lines of protocol and infrastructure code that has nothing to do with choosing an endpoint. The gRPC picker service lets implementors skip all of it.
+
+**Latency note:** The additional gRPC hop adds ~0.1–0.5ms on localhost/sidecar, ~0.5–2ms across pods in the same AZ. The `PickRequest` message is small (headers map, model string, endpoint list), so serialization overhead is negligible. For context, the ext-proc call from Envoy to the Light EPP already incurs a similar hop, and model server inference responses typically take 50ms–10s+.
 
 **Best for:** rapid prototyping, simple selection logic, teams that don't want to maintain Kubernetes controller code in their language.
 
@@ -271,9 +272,9 @@ Envoy ──ext-proc──► Rust EPP (implements ext-proc directly)
 
 The non-Go code implements the full Envoy ext-proc service, the EPP protocol metadata, and Kubernetes CRD watching natively. There is no Go intermediary.
 
-This is more work upfront but gives full control over performance, memory, and the request lifecycle. The ext-proc protocol is defined in protobuf (`envoy.service.ext_proc.v3.ExternalProcessor`), so any language with gRPC support can implement it directly. The EPP protocol (proposal 004) is just metadata key conventions on top of ext-proc — no additional protocol to implement.
+This is more work upfront (~900 lines equivalent of protocol and Kubernetes plumbing) but gives full control over the entire stack with no Go dependency. The ext-proc protocol is defined in protobuf (`envoy.service.ext_proc.v3.ExternalProcessor`), so any language with gRPC support can implement it directly. The EPP protocol (proposal 004) is just metadata key conventions on top of ext-proc — no additional wire protocol to implement.
 
-**Best for:** production deployments where the extra gRPC hop is undesirable, teams that want full ownership of the stack (e.g., llm-d), or when the selection logic needs tight integration with the request lifecycle.
+**Best for:** teams that want full ownership of the stack with no intermediary (e.g., llm-d), or when the selection logic needs tight integration with the request lifecycle (e.g., custom response processing, streaming-aware routing).
 
 Both approaches are valid. The `picker.proto` and the ext-proc protocol are complementary — they serve different levels of abstraction for different needs.
 
@@ -483,7 +484,11 @@ All pickers (including Go ones) would communicate via gRPC to a separate process
 
 The existing plugin framework (`framework/interface/scheduling/plugins.go`) defines Filter, Scorer, and Picker as separate interfaces composed into SchedulerProfiles. This is powerful but forces implementors to understand the profile/filter/scorer/picker pipeline. A single `Pick` method is a lower abstraction barrier.
 
-### 4. Use `fwkdl.Endpoint` interface instead of a flat struct
+### 5. CGo/FFI bindings (Go → C → Rust) instead of gRPC
+
+Instead of a gRPC call to a remote picker, the Rust selection logic could be compiled as a C-compatible library and called directly from Go via CGo + Rust FFI. This eliminates the ~0.5ms network hop but introduces significant trade-offs: CGo pins an OS thread per call (breaking Go's goroutine concurrency model under load), the build requires Go + C + Rust toolchains, memory must be manually managed across the FFI boundary, debugging tools can't cross the language boundary, and a panic in Rust kills the entire Go process including the ext-proc server and Kubernetes controllers. For a production Rust EPP where the team wants full ownership of the stack with no Go dependency, the native ext-proc implementation (Approach B) is the better fit — full Rust, no intermediary.
+
+### 6. Use `fwkdl.Endpoint` interface instead of a flat struct
 
 The existing `fwkdl.Endpoint` interface requires `GetMetrics()`, `GetAttributes()`, `UpdateMetrics()`, and the `EndpointFactory` abstraction. This pulls in the data layer framework. A simple struct with Address, Port, Name, Labels is sufficient for routing decisions and avoids the coupling. The flat struct also maps cleanly to the `EndpointInfo` protobuf message for cross-language support.
 
