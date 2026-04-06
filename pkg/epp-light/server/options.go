@@ -34,6 +34,10 @@ type Options struct {
 	PoolName      string
 	SecureServing bool
 	CertPath      string
+	// PickerAddress is the address of a remote gRPC EndpointPickerService.
+	// When set, the light EPP delegates endpoint selection to this service
+	// instead of using the in-process picker. This enables non-Go implementations.
+	PickerAddress string
 }
 
 // NewOptions returns Options with default values.
@@ -54,6 +58,10 @@ func (o *Options) AddFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&o.PoolName, "pool-name", o.PoolName, "Name of the InferencePool.")
 	fs.BoolVar(&o.SecureServing, "secure-serving", o.SecureServing, "Enables TLS for the gRPC server.")
 	fs.StringVar(&o.CertPath, "cert-path", o.CertPath, "Path to TLS certificate (tls.crt and tls.key).")
+	fs.StringVar(&o.PickerAddress, "picker-address", o.PickerAddress,
+		"Address of a remote gRPC EndpointPickerService (e.g., localhost:9010). "+
+			"When set, endpoint selection is delegated to this service. "+
+			"When unset, the in-process picker is used.")
 }
 
 // Validate checks that required options are set.

@@ -20,7 +20,7 @@ The Light EPP is intended to serve as:
 
 1. A **reference implementation** for the Endpoint Picker Protocol (proposal 004)
 2. A **conformance testing target** for gateway providers
-3. A **starting point** for third-party EPP implementations
+3. A **starting point** for third-party EPP implementations in any language
 
 ## Goals
 
@@ -28,7 +28,8 @@ The Light EPP is intended to serve as:
 - Fully implement the [Endpoint Picker Protocol](../004-endpoint-picker-protocol/README.md) (subset filtering, destination metadata, fallback endpoints)
 - Support the stable `v1` InferencePool CRD for pod discovery
 - Provide a default random-selection implementation as a reference
-- Keep the codebase minimal (~12 files) and self-contained with zero imports from `pkg/epp/`
+- **Enable cross-language implementations** via a gRPC `EndpointPickerService` protobuf definition, so Rust, Python, C++, or any language can implement custom endpoint selection
+- Keep the codebase minimal (~17 files) and self-contained with zero imports from `pkg/epp/`
 
 ## Non-Goals
 
@@ -82,6 +83,164 @@ The Light EPP decomposes the EPP into two layers:
                     |  - Any custom algorithm                 |
                     +-----------------------------------------+
 ```
+
+### Cross-Language Support via gRPC Picker Service
+
+The Go `EndpointPicker` interface only works for in-process Go implementations. To enable endpoint selection in **any language** (Rust, Python, C++, etc.), the Light EPP also defines a gRPC `EndpointPickerService` protobuf:
+
+```protobuf
+// pkg/epp-light/proto/picker.proto
+
+syntax = "proto3";
+package epplight;
+
+service EndpointPickerService {
+  rpc Pick(PickRequest) returns (PickResponse);
+}
+
+message PickRequest {
+  map<string, string> headers = 1;
+  bytes body = 2;
+  string model = 3;
+  repeated string candidate_subset = 4;
+  repeated EndpointInfo endpoints = 5;
+}
+
+message EndpointInfo {
+  string address = 1;
+  string port = 2;
+  string name = 3;
+  map<string, string> labels = 4;
+}
+
+message PickResponse {
+  string endpoint = 1;
+  repeated string fallbacks = 2;
+}
+```
+
+The protobuf messages mirror the Go types exactly (`RequestInfo` ↔ `PickRequest`, `Endpoint` ↔ `EndpointInfo`, `PickResult` ↔ `PickResponse`), making the mapping trivial.
+
+#### How Both Paths Coexist
+
+A `GRPCPicker` adapter implements the Go `EndpointPicker` interface by calling out to a remote gRPC service. The `server.go` Process loop doesn't change — it always calls `s.picker.Pick()`. The picker is either in-process or remote:
+
+```
+                       In-process (Go)
+                      ┌────────────────────────┐
+                      │  RandomPicker          │
+                      │  or custom Go picker    │
+                      └────────────────────────┘
+                                ▲
+                                │ (implements EndpointPicker)
+                                │
+server.go ──── picker.Pick() ──┤
+                                │
+                                │ (implements EndpointPicker via gRPC)
+                                ▼
+                      ┌────────────────────────┐
+                      │  GRPCPicker            │──── gRPC ────► Remote Service
+                      │  (adapter/client)       │               (Rust, Python, etc.)
+                      └────────────────────────┘
+```
+
+The `--picker-address` CLI flag controls which path is used:
+- **Unset** → in-process picker (default `RandomPicker`, or custom Go picker via `runner.WithPicker()`)
+- **Set** (e.g., `--picker-address=localhost:9010`) → `GRPCPicker` connects to the remote service
+
+#### Benefits of this Approach
+
+1. **Language-agnostic** — any language with gRPC support can implement the picker service. The `.proto` file is the contract.
+2. **No protocol reimplementation** — non-Go implementations don't need to understand ext-proc, Envoy metadata, subset filtering, or Kubernetes CRDs. The Go Light EPP handles all of that.
+3. **Zero overhead for Go** — in-process Go pickers use a direct function call with no serialization or network hop.
+4. **Independently deployable** — the picker service can be scaled, versioned, and deployed separately from the protocol layer.
+5. **Testable** — the proto definition enables generating client/server stubs in any language for testing.
+
+#### Implementing an EPP in Rust
+
+A Rust implementation follows these steps:
+
+**Step 1: Generate Rust stubs from `picker.proto`**
+
+Add the proto to your Rust project and use `tonic-build`:
+
+```rust
+// build.rs
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tonic_build::compile_protos("path/to/picker.proto")?;
+    Ok(())
+}
+```
+
+**Step 2: Implement the `EndpointPickerService` trait**
+
+```rust
+use tonic::{Request, Response, Status};
+
+pub struct MyRustPicker;
+
+#[tonic::async_trait]
+impl EndpointPickerService for MyRustPicker {
+    async fn pick(
+        &self,
+        request: Request<PickRequest>,
+    ) -> Result<Response<PickResponse>, Status> {
+        let req = request.into_inner();
+
+        // Custom selection logic using req.model, req.headers,
+        // req.endpoints, req.candidate_subset, req.body, etc.
+        let chosen = req.endpoints.first()
+            .ok_or_else(|| Status::unavailable("no endpoints"))?;
+
+        Ok(Response::new(PickResponse {
+            endpoint: format!("{}:{}", chosen.address, chosen.port),
+            fallbacks: vec![],
+        }))
+    }
+}
+```
+
+**Step 3: Run the gRPC server**
+
+```rust
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let addr = "0.0.0.0:9010".parse()?;
+    let picker = MyRustPicker;
+
+    Server::builder()
+        .add_service(EndpointPickerServiceServer::new(picker))
+        .serve(addr)
+        .await?;
+
+    Ok(())
+}
+```
+
+**Step 4: Run the Go Light EPP pointing to the Rust service**
+
+```bash
+# Start the Rust picker service
+cargo run  # listens on :9010
+
+# Start the Go Light EPP, delegating selection to Rust
+epp-light --pool-name=my-pool --pool-namespace=default --picker-address=localhost:9010
+```
+
+The full request flow becomes:
+
+```
+Client ──HTTP──► Envoy ──ext-proc──► Go Light EPP ──gRPC──► Rust Picker
+                                     (protocol layer)        (selection logic)
+                                     handles:                handles:
+                                     - ext-proc state        - endpoint selection
+                                     - metadata keys         - custom routing
+                                     - subset filtering      - model affinity
+                                     - pod discovery         - etc.
+                                     - InferencePool CRD
+```
+
+The Rust implementation only needs to decide *which* endpoint — everything else is handled by the Go protocol layer.
 
 ### Core Interface
 
@@ -157,22 +316,28 @@ Request → extractModel → resolveSubset+filterEndpoints → picker.Pick → r
 pkg/epp-light/
     picker.go              — EndpointPicker interface, Endpoint/RequestInfo/PickResult types
     picker_random.go       — Default random picker (reference implementation)
+    picker_grpc.go         — GRPCPicker: implements EndpointPicker via remote gRPC service
     metadata.go            — EPP protocol constants (proposal 004)
     datastore.go           — Simplified datastore (pool + pods only)
     server.go              — Ext-proc StreamingServer with Process loop
     request.go             — Request handling, metadata generation, subset filtering
     response.go            — Response handling
+    proto/
+        picker.proto       — EndpointPickerService protobuf definition
+        gen/               — Generated Go stubs (picker.pb.go, picker_grpc.pb.go)
     controller/
         pool.go            — InferencePool v1 reconciler
         pod.go             — Pod reconciler
     server/
         runner.go          — ExtProcServerRunner (gRPC wiring)
-        options.go         — Minimal CLI flags
+        options.go         — Minimal CLI flags (including --picker-address)
 cmd/epp-light/
-    main.go                — Entrypoint with RandomPicker
+    main.go                — Entrypoint
+    runner/
+        runner.go          — Runner with WithPicker() and gRPC picker wiring
 ```
 
-12 files total, versus dozens in `pkg/epp/`.
+17 files total, versus dozens in `pkg/epp/`.
 
 ### Dependency Isolation
 
@@ -202,25 +367,21 @@ The 4 EPP protocol constants (`SubsetFilterNamespace`, `SubsetFilterKey`, `Desti
 
 Retained: pool set/get with pod resync, pod CRUD via `sync.Map`, rank-based endpoint naming for multi-port, `activePortsAnnotation` support, label selector matching.
 
-### Usage Example
+### Usage Examples
 
-Building a custom EPP requires implementing one interface:
+#### Option A: Custom Go Picker (in-process)
 
 ```go
 package main
 
 import (
-    "context"
-    "fmt"
     "os"
 
     ctrl "sigs.k8s.io/controller-runtime"
+    "sigs.k8s.io/gateway-api-inference-extension/cmd/epp-light/runner"
     epplight "sigs.k8s.io/gateway-api-inference-extension/pkg/epp-light"
-    "sigs.k8s.io/gateway-api-inference-extension/pkg/epp-light/server"
 )
 
-// ModelAwarePicker routes requests to endpoints whose pods are labeled
-// with the requested model name.
 type ModelAwarePicker struct{}
 
 func (p *ModelAwarePicker) Pick(
@@ -228,45 +389,37 @@ func (p *ModelAwarePicker) Pick(
     req *epplight.RequestInfo,
     endpoints []epplight.Endpoint,
 ) (*epplight.PickResult, error) {
-    // Route to endpoints labeled with the target model.
     for _, ep := range endpoints {
         if ep.Labels["model"] == req.Model {
-            return &epplight.PickResult{
-                Endpoint: ep.Address + ":" + ep.Port,
-            }, nil
+            return &epplight.PickResult{Endpoint: ep.Address + ":" + ep.Port}, nil
         }
     }
-    // Fallback: first available endpoint.
     if len(endpoints) > 0 {
         ep := endpoints[0]
-        return &epplight.PickResult{
-            Endpoint: ep.Address + ":" + ep.Port,
-        }, nil
+        return &epplight.PickResult{Endpoint: ep.Address + ":" + ep.Port}, nil
     }
-    return nil, fmt.Errorf("no endpoints available for model %q", req.Model)
+    return nil, fmt.Errorf("no endpoints for model %q", req.Model)
 }
 
 func main() {
-    // Wire the custom picker into the light EPP server.
-    opts := server.NewOptions()
-    opts.AddFlags(pflag.CommandLine)
-    pflag.Parse()
-
-    mgr, _ := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{Scheme: scheme})
-    ds := epplight.NewDatastore()
-
-    runner := &server.ExtProcServerRunner{
-        GRPCPort:      opts.GRPCPort,
-        PoolNamespace: opts.PoolNamespace,
-        PoolName:      opts.PoolName,
-        Datastore:     ds,
-        Picker:        &ModelAwarePicker{},
+    if err := runner.NewRunner().WithPicker(&ModelAwarePicker{}).Run(ctrl.SetupSignalHandler()); err != nil {
+        os.Exit(1)
     }
-    runner.SetupWithManager(mgr)
-    mgr.Add(runner.AsRunnable(logger))
-    mgr.Start(ctrl.SetupSignalHandler())
 }
 ```
+
+#### Option B: Remote Picker via gRPC (any language)
+
+No custom Go code needed — just run the binary with `--picker-address`:
+
+```bash
+epp-light \
+    --pool-name=my-pool \
+    --pool-namespace=default \
+    --picker-address=localhost:9010
+```
+
+The remote service at `localhost:9010` implements `EndpointPickerService` from `picker.proto` in any language. See [Implementing an EPP in Rust](#implementing-an-epp-in-rust) for a complete example.
 
 ## Protocol Conformance
 
@@ -283,27 +436,37 @@ The Light EPP fully implements the [Endpoint Picker Protocol](../004-endpoint-pi
 
 ## Alternatives Considered
 
-### 1. Define EndpointPicker as a plugin within the existing framework
+### 1. Go interface only, no gRPC picker service
+
+A Rust or Python EPP would have to reimplement the entire ext-proc protocol layer (Process loop, state machine, metadata generation, subset filtering, pod discovery). This is hundreds of lines of protocol-specific code that has nothing to do with endpoint selection. The gRPC picker service lets non-Go implementations focus purely on selection logic while the Go Light EPP handles everything else.
+
+### 2. gRPC only, no in-process Go interface
+
+All pickers (including Go ones) would communicate via gRPC. This simplifies the architecture (one path instead of two) but adds a network hop and serialization overhead for Go pickers that don't need it. The dual-path approach (in-process for Go, gRPC for others) gives zero overhead when it's not needed.
+
+### 3. Define EndpointPicker as a plugin within the existing framework
 
 The existing plugin framework (`framework/interface/scheduling/plugins.go`) defines Filter, Scorer, and Picker as separate interfaces composed into SchedulerProfiles. This is powerful but forces implementors to understand the profile/filter/scorer/picker pipeline. A single `Pick` method is a lower abstraction barrier.
 
-### 2. Use `fwkdl.Endpoint` interface instead of a flat struct
+### 4. Use `fwkdl.Endpoint` interface instead of a flat struct
 
-The existing `fwkdl.Endpoint` interface requires `GetMetrics()`, `GetAttributes()`, `UpdateMetrics()`, and the `EndpointFactory` abstraction. This pulls in the data layer framework. A simple struct with Address, Port, Name, Labels is sufficient for routing decisions and avoids the coupling.
+The existing `fwkdl.Endpoint` interface requires `GetMetrics()`, `GetAttributes()`, `UpdateMetrics()`, and the `EndpointFactory` abstraction. This pulls in the data layer framework. A simple struct with Address, Port, Name, Labels is sufficient for routing decisions and avoids the coupling. The flat struct also maps cleanly to the `EndpointInfo` protobuf message for cross-language support.
 
 ## Testing
 
 ### Unit Tests
 
 - `picker_random_test.go` — Random selection, empty list error, distribution across endpoints
+- `picker_grpc_test.go` — GRPCPicker with mock gRPC server: verify Go→proto→Go round-trip for all types
 - `datastore_test.go` — Pool set/get, pod CRUD, label matching, endpoint listing, active ports
 - `server_test.go` — Ext-proc Process loop with mock stream (header-only, body, subset filtering, no-endpoints)
 - `request_test.go` — `extractModelFromBody`, `extractCandidateSubset`, `filterEndpointsBySubset`, metadata generation
 - `controller/*_test.go` — Pool and pod reconcilers with fake k8s client
 
-### Integration Test
+### Integration Tests
 
-- Start full Light EPP against a fake k8s client, send ext-proc requests via gRPC client, verify endpoint selection appears in both headers and dynamic metadata
+- Start full Light EPP against a fake k8s client with in-process picker, send ext-proc requests via gRPC client, verify endpoint selection in headers and dynamic metadata
+- Start full Light EPP with `--picker-address` pointing to a test gRPC picker server, verify the remote picker is called and endpoints are returned correctly
 
 ### Conformance Checks
 
@@ -318,7 +481,7 @@ Per proposal 004:
 ### Build Verification
 
 ```bash
-go build ./pkg/epp-light/...
-go build ./cmd/epp-light/...
-go vet ./pkg/epp-light/... ./cmd/epp-light/...
+make generate-proto-light                          # Generate proto code
+go build ./pkg/epp-light/... ./cmd/epp-light/...   # Build all packages
+go vet ./pkg/epp-light/... ./cmd/epp-light/...     # Vet
 ```

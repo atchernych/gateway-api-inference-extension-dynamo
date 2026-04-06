@@ -82,12 +82,23 @@ func (r *Runner) Run(ctx context.Context) error {
 
 	datastore := epplight.NewDatastore()
 
+	// Use remote gRPC picker if --picker-address is set, otherwise use in-process picker.
+	picker := r.picker
+	if opts.PickerAddress != "" {
+		logger.Info("Using remote gRPC picker", "address", opts.PickerAddress)
+		grpcPicker, err := epplight.NewGRPCPicker(opts.PickerAddress)
+		if err != nil {
+			return fmt.Errorf("failed to create gRPC picker: %w", err)
+		}
+		picker = grpcPicker
+	}
+
 	serverRunner := &server.ExtProcServerRunner{
 		GRPCPort:      opts.GRPCPort,
 		PoolNamespace: opts.PoolNamespace,
 		PoolName:      opts.PoolName,
 		Datastore:     datastore,
-		Picker:        r.picker,
+		Picker:        picker,
 		SecureServing: opts.SecureServing,
 		CertPath:      opts.CertPath,
 	}
