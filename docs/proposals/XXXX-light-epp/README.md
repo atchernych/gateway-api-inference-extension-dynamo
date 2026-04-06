@@ -40,16 +40,7 @@ The Light EPP is intended to serve as:
 
 ## Motivation
 
-The current `pkg/epp/` is a full-featured, production-grade system with:
-
-- A scheduling framework with profiles, filters, scorers, and pickers
-- Flow control with saturation detection, fairness policies, and queuing
-- A pluggable data layer with polling, notifications, and extractors
-- Plugin registry with DAG-based dependency validation
-- Support for InferenceObjective and InferenceModelRewrite CRDs
-- Backend metrics collection from model servers
-
-This complexity is necessary for production AI/ML workloads but creates a high barrier for:
+The current `pkg/epp/` is a full-featured, production-grade system but it creates a high barrier for:
 
 - **Gateway providers** who need a conformance target for the EPP protocol
 - **Third-party implementors** who want to build custom endpoint selection without understanding 30+ files of internal machinery
@@ -292,15 +283,11 @@ The Light EPP fully implements the [Endpoint Picker Protocol](../004-endpoint-pi
 
 ## Alternatives Considered
 
-### 1. Make `pkg/epp/` more modular instead of creating a new package
-
-This was considered but rejected because the full EPP has deep coupling between the Director, Scheduler, DataLayer, FlowControl, and plugin framework. Making it modular enough for a "light mode" would require significant refactoring of existing code while maintaining backward compatibility, which is riskier than a clean, minimal implementation.
-
-### 2. Define EndpointPicker as a plugin within the existing framework
+### 1. Define EndpointPicker as a plugin within the existing framework
 
 The existing plugin framework (`framework/interface/scheduling/plugins.go`) defines Filter, Scorer, and Picker as separate interfaces composed into SchedulerProfiles. This is powerful but forces implementors to understand the profile/filter/scorer/picker pipeline. A single `Pick` method is a lower abstraction barrier.
 
-### 3. Use `fwkdl.Endpoint` interface instead of a flat struct
+### 2. Use `fwkdl.Endpoint` interface instead of a flat struct
 
 The existing `fwkdl.Endpoint` interface requires `GetMetrics()`, `GetAttributes()`, `UpdateMetrics()`, and the `EndpointFactory` abstraction. This pulls in the data layer framework. A simple struct with Address, Port, Name, Labels is sufficient for routing decisions and avoids the coupling.
 
