@@ -86,7 +86,7 @@ The Light EPP decomposes the EPP into two layers:
 
 ### Cross-Language Support via gRPC Picker Service
 
-The Go `EndpointPicker` interface only works for in-process Go implementations. To enable endpoint selection in **any language** (Rust, Python, C++, etc.), the Light EPP also defines a gRPC `EndpointPickerService` protobuf:
+The Go `EndpointPicker` interface only works for Go implementations compiled into the same binary as the Light EPP server. To enable endpoint selection in **any language** (Rust, Python, C++, etc.), the Light EPP also defines a gRPC `EndpointPickerService` protobuf:
 
 ```protobuf
 // pkg/epp-light/proto/picker.proto
@@ -123,10 +123,10 @@ The protobuf messages mirror the Go types exactly (`RequestInfo` ↔ `PickReques
 
 #### How Both Paths Coexist
 
-A `GRPCPicker` adapter implements the Go `EndpointPicker` interface by calling out to a remote gRPC service. The `server.go` Process loop doesn't change — it always calls `s.picker.Pick()`. The picker is either in-process or remote:
+A `GRPCPicker` adapter implements the Go `EndpointPicker` interface by calling out to a remote gRPC service. The `server.go` Process loop doesn't change — it always calls `s.picker.Pick()`. The picker is either local (same binary) or remote (separate process):
 
 ```
-                       In-process (Go)
+                       Local Go picker (same binary)
                       ┌────────────────────────┐
                       │  RandomPicker          │
                       │  or custom Go picker    │
@@ -140,20 +140,20 @@ server.go ──── picker.Pick() ──┤
                                 ▼
                       ┌────────────────────────┐
                       │  GRPCPicker            │──── gRPC ────► Remote Service
-                      │  (adapter/client)       │               (Rust, Python, etc.)
-                      └────────────────────────┘
+                      │  (adapter/client)       │               (separate process:
+                      └────────────────────────┘                Rust, Python, etc.)
 ```
 
 The `--picker-address` CLI flag controls which path is used:
-- **Unset** → in-process picker (default `RandomPicker`, or custom Go picker via `runner.WithPicker()`)
-- **Set** (e.g., `--picker-address=localhost:9010`) → `GRPCPicker` connects to the remote service
+- **Unset** → local Go picker (default `RandomPicker`, or custom Go picker via `runner.WithPicker()`)
+- **Set** (e.g., `--picker-address=localhost:9010`) → `GRPCPicker` connects to a remote picker service
 
 #### Benefits of this Approach
 
 1. **Language-agnostic** — any language with gRPC support can implement the picker service. The `.proto` file is the contract.
 2. **No protocol reimplementation** — non-Go implementations don't need to understand ext-proc, Envoy metadata, subset filtering, or Kubernetes CRDs. The Go Light EPP handles all of that.
-3. **Zero overhead for Go** — in-process Go pickers use a direct function call with no serialization or network hop.
-4. **Independently deployable** — the picker service can be scaled, versioned, and deployed separately from the protocol layer.
+3. **Zero overhead for Go** — local Go pickers use a direct function call within the same process, with no serialization or network hop.
+4. **Independently deployable** — the remote picker service can be scaled, versioned, and deployed separately from the protocol layer.
 5. **Testable** — the proto definition enables generating client/server stubs in any language for testing.
 
 #### Implementing an EPP in Rust
@@ -241,6 +241,41 @@ Client ──HTTP──► Envoy ──ext-proc──► Go Light EPP ──gRPC
 ```
 
 The Rust implementation only needs to decide *which* endpoint — everything else is handled by the Go protocol layer.
+
+#### When to Use the gRPC Picker vs. a Native ext-proc Implementation
+
+The gRPC picker service is a **convenience layer**, not a requirement. There are two valid approaches for building a non-Go EPP, and the right choice depends on the use case:
+
+**Approach A: gRPC Picker via the Light EPP (recommended for prototyping and simple use cases)**
+
+```
+Envoy ──ext-proc──► Go Light EPP ──gRPC──► Rust/Python Picker
+```
+
+The non-Go code only implements endpoint selection. The Go Light EPP handles:
+- The ext-proc bidirectional streaming state machine (7 request states, correct response ordering, chunking)
+- EPP protocol metadata (`envoy.lb` namespace, `x-gateway-destination-endpoint` in headers and dynamic metadata)
+- Subset filtering from `envoy.lb.subset_hint`
+- InferencePool CRD watching (Kubernetes controller-runtime, pod reconciliation, label selectors, readiness tracking)
+- Error responses (`ImmediateResponse` with 503/429 per the protocol spec)
+
+This is ~500 lines of protocol-specific code that has nothing to do with choosing an endpoint. The gRPC picker service lets implementors skip all of it.
+
+**Best for:** rapid prototyping, simple selection logic, teams that don't want to maintain Kubernetes controller code in their language.
+
+**Approach B: Native ext-proc implementation (recommended for production)**
+
+```
+Envoy ──ext-proc──► Rust EPP (implements ext-proc directly)
+```
+
+The non-Go code implements the full Envoy ext-proc service, the EPP protocol metadata, and Kubernetes CRD watching natively. There is no Go intermediary.
+
+This is more work upfront but gives full control over performance, memory, and the request lifecycle. The ext-proc protocol is defined in protobuf (`envoy.service.ext_proc.v3.ExternalProcessor`), so any language with gRPC support can implement it directly. The EPP protocol (proposal 004) is just metadata key conventions on top of ext-proc — no additional protocol to implement.
+
+**Best for:** production deployments where the extra gRPC hop is undesirable, teams that want full ownership of the stack (e.g., llm-d), or when the selection logic needs tight integration with the request lifecycle.
+
+Both approaches are valid. The `picker.proto` and the ext-proc protocol are complementary — they serve different levels of abstraction for different needs.
 
 ### Core Interface
 
@@ -369,7 +404,7 @@ Retained: pool set/get with pod resync, pod CRUD via `sync.Map`, rank-based endp
 
 ### Usage Examples
 
-#### Option A: Custom Go Picker (in-process)
+#### Option A: Custom Go Picker (local, same binary)
 
 ```go
 package main
@@ -408,7 +443,7 @@ func main() {
 }
 ```
 
-#### Option B: Remote Picker via gRPC (any language)
+#### Option B: Remote Picker via gRPC (separate process, any language)
 
 No custom Go code needed — just run the binary with `--picker-address`:
 
@@ -440,9 +475,9 @@ The Light EPP fully implements the [Endpoint Picker Protocol](../004-endpoint-pi
 
 A Rust or Python EPP would have to reimplement the entire ext-proc protocol layer (Process loop, state machine, metadata generation, subset filtering, pod discovery). This is hundreds of lines of protocol-specific code that has nothing to do with endpoint selection. The gRPC picker service lets non-Go implementations focus purely on selection logic while the Go Light EPP handles everything else.
 
-### 2. gRPC only, no in-process Go interface
+### 2. gRPC only, no local Go interface
 
-All pickers (including Go ones) would communicate via gRPC. This simplifies the architecture (one path instead of two) but adds a network hop and serialization overhead for Go pickers that don't need it. The dual-path approach (in-process for Go, gRPC for others) gives zero overhead when it's not needed.
+All pickers (including Go ones) would communicate via gRPC to a separate process. This simplifies the architecture (one path instead of two) but adds a network hop and serialization overhead for Go pickers that don't need it. The dual-path approach (local for Go, remote gRPC for other languages) gives zero overhead when it's not needed.
 
 ### 3. Define EndpointPicker as a plugin within the existing framework
 
@@ -465,7 +500,7 @@ The existing `fwkdl.Endpoint` interface requires `GetMetrics()`, `GetAttributes(
 
 ### Integration Tests
 
-- Start full Light EPP against a fake k8s client with in-process picker, send ext-proc requests via gRPC client, verify endpoint selection in headers and dynamic metadata
+- Start full Light EPP against a fake k8s client with local Go picker, send ext-proc requests via gRPC client, verify endpoint selection in headers and dynamic metadata
 - Start full Light EPP with `--picker-address` pointing to a test gRPC picker server, verify the remote picker is called and endpoints are returned correctly
 
 ### Conformance Checks

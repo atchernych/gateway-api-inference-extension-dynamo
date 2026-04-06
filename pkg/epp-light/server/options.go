@@ -35,8 +35,9 @@ type Options struct {
 	SecureServing bool
 	CertPath      string
 	// PickerAddress is the address of a remote gRPC EndpointPickerService.
-	// When set, the light EPP delegates endpoint selection to this service
-	// instead of using the in-process picker. This enables non-Go implementations.
+	// When set, the light EPP delegates endpoint selection to this remote service
+	// instead of using the local Go picker. This enables non-Go implementations
+	// (Rust, Python, etc.) to provide custom selection logic in a separate process.
 	PickerAddress string
 }
 
